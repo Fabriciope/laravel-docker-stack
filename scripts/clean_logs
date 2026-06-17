@@ -1,0 +1,217 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# clean_logs — esvazia (trunca) os arquivos de log do projeto.
+#
+# Em vez de apagar os arquivos, o script os deixa VAZIOS (truncate -s 0).
+# Truncar preserva inode, dono e permissões, e mantém válidos os file handles
+# já abertos pelos processos (php-fpm, nginx, laravel, horizon...). Assim os
+# logs continuam sendo escritos no mesmo arquivo, sem precisar recriá-lo nem
+# reiniciar nada.
+#
+# Os logs vivem em storage/logs/ — o mesmo diretório que é bind-montado nos
+# containers de produção (web-server, php-fpm, horizon, scheduler).
+#
+# Uso:
+#   ./scripts/clean_logs                 # lista e trunca TODOS os .log
+#   ./scripts/clean_logs --list          # apenas lista os arquivos numerados
+#   ./scripts/clean_logs --list php-fpm  # lista só os .log do subdiretório
+#   ./scripts/clean_logs --except=1,3    # trunca todos, EXCETO os índices 1 e 3
+#   ./scripts/clean_logs --only=2,4      # trunca SOMENTE os índices 2 e 4
+#   ./scripts/clean_logs --dry-run       # mostra o que faria, sem alterar nada
+#   ./scripts/clean_logs nginx           # restringe a um subdiretório de logs
+#   ./scripts/clean_logs --only=2 php-fpm
+#   ./scripts/clean_logs --no-cache-clear  # não roda log-viewer:clear-cache
+#
+# --except e --only são inversos e mutuamente exclusivos. Os índices correspondem
+# à numeração exibida por --list (e impressa antes de truncar). Rode
+# `--list [subdir]` primeiro para descobrir os números.
+#
+# Após truncar, o script roda automaticamente `log-viewer:clear-cache` dentro do
+# container php-fpm (best-effort; desative com --no-cache-clear). Veja NOTA no fim.
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOGS_ROOT="$PROJECT_DIR/storage/logs"
+
+# --- cores (só em TTY e quando NO_COLOR não estiver setado) ------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'; BLUE=$'\033[34m'; RESET=$'\033[0m'
+else
+  BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; BLUE=''; RESET=''
+fi
+
+# --- parsing de argumentos ---------------------------------------------------
+LIST_ONLY=false
+DRY_RUN=false
+CACHE_CLEAR=true
+EXCEPT_RAW=""
+ONLY_RAW=""
+SUBDIR=""
+
+usage() {
+  sed -n '5,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --list|-l)        LIST_ONLY=true ;;
+    --dry-run|-n)     DRY_RUN=true ;;
+    --no-cache-clear) CACHE_CLEAR=false ;;
+    --except=*)       EXCEPT_RAW="${arg#--except=}" ;;
+    --only=*)         ONLY_RAW="${arg#--only=}" ;;
+    --help|-h)        usage 0 ;;
+    -*)               echo "${RED}Opção desconhecida: $arg${RESET}" >&2; usage 1 ;;
+    *)
+      if [ -n "$SUBDIR" ]; then
+        echo "${RED}Subdiretório já informado ('$SUBDIR'); argumento extra: '$arg'${RESET}" >&2
+        exit 1
+      fi
+      SUBDIR="$arg"
+      ;;
+  esac
+done
+
+# --- diretório alvo ----------------------------------------------------------
+TARGET_DIR="$LOGS_ROOT"
+[ -n "$SUBDIR" ] && TARGET_DIR="$LOGS_ROOT/$SUBDIR"
+
+if [ ! -d "$TARGET_DIR" ]; then
+  echo "${RED}Diretório de logs não encontrado: $TARGET_DIR${RESET}" >&2
+  exit 1
+fi
+
+# --- coleta dinâmica dos arquivos .log (ordem estável) -----------------------
+mapfile -t FILES < <(find "$TARGET_DIR" -type f -name '*.log' | sort)
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+  echo "${YELLOW}Nenhum arquivo .log encontrado em: $TARGET_DIR${RESET}"
+  exit 0
+fi
+
+# --- monta o conjunto de índices a preservar (SKIP) --------------------------
+# --except e --only são inversos: --except lista o que NÃO truncar; --only lista
+# o ÚNICO que truncar (todo o resto é preservado). São mutuamente exclusivos.
+if [ -n "$EXCEPT_RAW" ] && [ -n "$ONLY_RAW" ]; then
+  echo "${RED}Use --except OU --only, não os dois ao mesmo tempo.${RESET}" >&2
+  exit 1
+fi
+
+PICK_RAW="${EXCEPT_RAW}${ONLY_RAW}"   # apenas um deles está preenchido
+PICK_FLAG=""
+[ -n "$EXCEPT_RAW" ] && PICK_FLAG="--except"
+[ -n "$ONLY_RAW" ] && PICK_FLAG="--only"
+
+# Valida a lista CSV de índices informada e guarda em PICKED.
+declare -A PICKED=()
+if [ -n "$PICK_RAW" ]; then
+  IFS=',' read -ra PICK_IDS <<< "$PICK_RAW"
+  for id in "${PICK_IDS[@]}"; do
+    id="${id// /}"
+    [ -z "$id" ] && continue
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+      echo "${RED}Índice inválido em $PICK_FLAG: '$id' (use números separados por vírgula)${RESET}" >&2
+      exit 1
+    fi
+    if [ "$id" -lt 1 ] || [ "$id" -gt "${#FILES[@]}" ]; then
+      echo "${RED}Índice fora do intervalo em $PICK_FLAG: '$id' (válidos: 1..${#FILES[@]})${RESET}" >&2
+      exit 1
+    fi
+    PICKED["$id"]=1
+  done
+fi
+
+# Traduz PICKED em SKIP (índices que serão preservados, não truncados):
+#   --except: preserva os índices escolhidos.
+#   --only:   preserva todos os índices NÃO escolhidos.
+declare -A SKIP=()
+if [ "$PICK_FLAG" = "--except" ]; then
+  for id in "${!PICKED[@]}"; do SKIP["$id"]=1; done
+elif [ "$PICK_FLAG" = "--only" ]; then
+  for ((j = 1; j <= ${#FILES[@]}; j++)); do
+    [ -z "${PICKED[$j]:-}" ] && SKIP["$j"]=1
+  done
+fi
+
+# --- helpers -----------------------------------------------------------------
+human_size() {
+  # tamanho legível do arquivo ($1)
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec --suffix=B "$(stat -c%s "$1")"
+  else
+    stat -c%s "$1"
+  fi
+}
+
+# --- execução ----------------------------------------------------------------
+echo "${BOLD}Logs em:${RESET} $TARGET_DIR"
+echo
+
+cleaned=0
+kept=0
+i=0
+for file in "${FILES[@]}"; do
+  i=$((i + 1))
+  rel="${file#"$PROJECT_DIR"/}"
+  size="$(human_size "$file")"
+
+  if [ -n "${SKIP[$i]:-}" ]; then
+    printf '  %2d. %s[keep ]%s %-45s %s%8s%s\n' \
+      "$i" "$YELLOW" "$RESET" "$rel" "$DIM" "$size" "$RESET"
+    kept=$((kept + 1))
+    continue
+  fi
+
+  if $LIST_ONLY; then
+    printf '  %2d. %s[     ]%s %-45s %s%8s%s\n' \
+      "$i" "$BLUE" "$RESET" "$rel" "$DIM" "$size" "$RESET"
+    continue
+  fi
+
+  if $DRY_RUN; then
+    printf '  %2d. %s[clean]%s %-45s %s%8s%s  %s(dry-run)%s\n' \
+      "$i" "$GREEN" "$RESET" "$rel" "$DIM" "$size" "$RESET" "$DIM" "$RESET"
+    cleaned=$((cleaned + 1))
+    continue
+  fi
+
+  : > "$file"
+  printf '  %2d. %s[clean]%s %-45s %s%8s%s %s->%s %s0B%s\n' \
+    "$i" "$GREEN" "$RESET" "$rel" "$DIM" "$size" "$RESET" "$DIM" "$RESET" "$GREEN" "$RESET"
+  cleaned=$((cleaned + 1))
+done
+
+echo
+if $LIST_ONLY; then
+  echo "${BLUE}${#FILES[@]} arquivo(s) listado(s).${RESET}"
+elif $DRY_RUN; then
+  echo "${BOLD}Dry-run:${RESET} ${GREEN}$cleaned${RESET} seriam truncado(s), ${YELLOW}$kept${RESET} preservado(s)."
+else
+  echo "${GREEN}$cleaned arquivo(s) truncado(s)${RESET}, ${YELLOW}$kept preservado(s)${RESET}."
+fi
+
+# --- invalida o cache do log-viewer (best-effort) ----------------------------
+# O log-viewer indexa cada arquivo no cache (Redis, dentro do container). Truncar
+# já muda mtime/tamanho e invalida o índice na próxima visita, mas limpamos
+# explicitamente para garantir que nenhuma view aberta mostre offsets velhos.
+if ! $LIST_ONLY && ! $DRY_RUN && $CACHE_CLEAR && [ "$cleaned" -gt 0 ]; then
+  php_container="$(docker ps --format '{{.Names}}' 2>/dev/null \
+    | grep -E '^{{project-name}}-php-fpm_(prod|dev)$' | head -n 1 || true)"
+
+  if [ -z "$php_container" ]; then
+    echo
+    echo "${YELLOW}container php-fpm não está rodando — pulando log-viewer:clear-cache.${RESET}"
+  else
+    echo
+    echo "${BLUE}Limpando cache do log-viewer (${php_container})...${RESET}"
+    if "$SCRIPT_DIR/phartisan" log-viewer:clear-cache >/dev/null 2>&1; then
+      echo "${GREEN}cache do log-viewer limpo.${RESET}"
+    else
+      echo "${YELLOW}não foi possível limpar o cache (pacote ausente ou comando indisponível) — ignorando.${RESET}"
+    fi
+  fi
+fi

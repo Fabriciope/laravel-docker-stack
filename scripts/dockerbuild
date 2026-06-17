@@ -1,0 +1,34 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Verifica se ao menos um argumento foi passado
+if [ -z "$1" ]; then
+  echo "Uso: ./scripts/dockerbuild <prod|dev> [comandos do docker compose...]"
+  exit 1
+fi
+
+# Captura o primeiro argumento como ambiente
+AMBIENTE=$1
+shift # Remove o primeiro argumento ($1) da lista, deixando apenas os argumentos do docker-compose
+
+# Mapeia prod/dev para o nome do diretório e do projeto Docker
+case "$AMBIENTE" in
+  prod) AMBIENTE_DIR="production" ;;
+  dev)  AMBIENTE_DIR="development" ;;
+  *) echo "Ambiente '$AMBIENTE' não reconhecido. Use prod ou dev."; exit 1 ;;
+esac
+
+# Monta o caminho do docker-compose.yml com base no ambiente
+COMPOSE_FILE="$PROJECT_DIR/docker/$AMBIENTE_DIR/docker-compose.yml"
+
+# Verifica se o arquivo existe
+if [ ! -f "$COMPOSE_FILE" ]; then
+  echo "Arquivo $COMPOSE_FILE não encontrado!"
+  exit 2
+fi
+
+# Executa o docker compose com o arquivo apropriado e os argumentos restantes
+docker compose --project-name "{{project-name}}_${AMBIENTE_DIR}" --file "$COMPOSE_FILE" --env-file "$PROJECT_DIR/.env" "$@"

@@ -1,0 +1,33 @@
+.DS_Store
+.phpactor.json
+/.codex
+/.cursor/
+/.idea
+/.nova
+/.phpunit.cache
+/.vscode
+/.zed
+/node_modules
+/vendor
+_ide_helper.php
+/.config
+
+.git
+.gitignore
+.gitattributes
+.editorconfig
+.env
+.env.*
+!.env.example
+
+/scripts
+db-backup/
+
+# Caches compilados do Laravel: nunca devem ser assados na imagem. São gerados
+# em runtime (config:cache/route:cache via `optimize`) com o .env montado, ou
+# recriados no build por `package:discover`. Assar um config.php gerado sem o
+# .env real sobrescreveria a config de runtime e quebraria o app.
+/bootstrap/cache/*.php
+
+# Banco SQLite de dev — produção usa MySQL; não deve entrar na imagem.
+/database/*.sqlite

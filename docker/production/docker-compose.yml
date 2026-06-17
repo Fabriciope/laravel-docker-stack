@@ -1,0 +1,333 @@
+# =============================================================================
+# {{project-name}} — Nginx + PHP-FPM atrás do Traefik (PRODUÇÃO)
+# Acesso: https://{{project-name}}.example.com  (troque pelo seu domínio)
+# =============================================================================
+# Pré-requisitos:
+#   1. Traefik já rodando, conectado à rede externa `proxy-network`
+#   2. DNS do seu domínio apontando para o IP do servidor
+#   3. Rede externa criada:  docker network create proxy-network
+#   4. Volumes externos criados (o ./scripts/deploy prod --first-deploy faz isso)
+# =============================================================================
+
+services:
+    web-server:
+        container_name: "{{project-name}}-web-server_prod"
+
+        build:
+            context: ./../..
+            dockerfile: docker/production/nginx/Dockerfile
+
+        image: "{{project-name}}-web-server:${PROJECT_VERSION:-1.0.0}-prod"
+
+        restart: always
+
+        environment:
+            TZ: America/Sao_Paulo
+
+        volumes:
+            # public/ NÃO é bind mount: vem embutido na imagem (Dockerfile do nginx
+            # copia os assets do Vite e cria o symlink public/storage). Isso preserva
+            # a imutabilidade da imagem e o rollback por versão.
+            - public-storage:/var/www/storage/app/public:ro
+            - ./../../storage/logs:/var/www/storage/logs:rw
+
+        # Portas 80 e 443 removidas do bindding, pois o Traefik é o único ponto de entrada externo
+        expose:
+            - "80"
+
+        networks:
+            - proxy-network # rede compartilhada com o Traefik
+            - project-network # rede interna para comunicação com php-fpm
+
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
+
+        depends_on:
+            php-fpm:
+                condition: service_healthy
+
+        healthcheck:
+            test: ["CMD-SHELL", "curl -f http://localhost/ || exit 1"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 20s
+
+        labels:
+            - "traefik.enable=true"
+
+            # Roteador HTTPS
+            - "traefik.http.routers.{{project-name}}.rule=Host(`{{project-name}}.example.com`)"
+            - "traefik.http.routers.{{project-name}}.entrypoints=websecure"
+            - "traefik.http.routers.{{project-name}}.tls=true"
+            - "traefik.http.routers.{{project-name}}.tls.certresolver=letsencrypt"
+
+            # Porta interna que o Traefik usa para alcançar o Nginx
+            - "traefik.http.services.{{project-name}}.loadbalancer.server.port=80"
+
+            # Garante que o Traefik use a rede correta (proxy-network)
+            - "traefik.docker.network=proxy-network"
+
+            - "traefik.http.middlewares.{{project-name}}-ratelimit.ratelimit.average=100"
+            - "traefik.http.middlewares.{{project-name}}-ratelimit.ratelimit.burst=200"
+            - "traefik.http.middlewares.{{project-name}}-hsts.headers.stsSeconds=31536000"
+            - "traefik.http.middlewares.{{project-name}}-hsts.headers.stsIncludeSubdomains=true"
+            - "traefik.http.middlewares.{{project-name}}-hsts.headers.stsPreload=true"
+            - "traefik.http.middlewares.{{project-name}}-hsts.headers.forceSTSHeader=true"
+            - "traefik.http.middlewares.{{project-name}}-compress.compress=true"
+            - "traefik.http.routers.{{project-name}}.middlewares={{project-name}}-ratelimit@docker,{{project-name}}-hsts@docker,{{project-name}}-compress@docker"
+
+            # Metadados do container
+            - "com.{{project-name}}.project={{project-name}}"
+            - "com.{{project-name}}.service=web-server"
+            - "com.{{project-name}}.environment=production"
+    php-fpm:
+        container_name: "{{project-name}}-php-fpm_prod"
+
+        # Metadados do container
+        labels:
+            - "com.{{project-name}}.project={{project-name}}"
+            - "com.{{project-name}}.service=php-fpm"
+            - "com.{{project-name}}.environment=production"
+        build:
+            context: ./../..
+            dockerfile: docker/production/php-fpm/Dockerfile
+
+        image: "{{project-name}}-php-fpm:${PROJECT_VERSION:-1.0.0}-prod"
+
+        restart: always
+
+        environment:
+            TZ: America/Sao_Paulo
+
+        volumes:
+            - ./../../.env:/var/www/.env
+            - public-storage:/var/www/storage/app/public:rw
+            - ./../../storage/app/backups:/var/www/storage/app/backups:rw
+            - ./../../storage/logs:/var/www/storage/logs:rw
+
+        networks:
+            - project-network
+            # NOTE: php-fpm não precisa estar na rede do Traefik
+
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
+
+        depends_on:
+            db:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+
+        healthcheck:
+            test: ["CMD-SHELL", "cgi-fcgi -bind -connect 127.0.0.1:9000"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 20s
+
+    horizon:
+        container_name: "{{project-name}}-horizon_prod"
+
+        # Metadados do container
+        labels:
+            - "com.{{project-name}}.project={{project-name}}"
+            - "com.{{project-name}}.service=horizon"
+            - "com.{{project-name}}.environment=production"
+        build:
+            context: ./../..
+            dockerfile: docker/production/php-fpm/Dockerfile
+
+        image: "{{project-name}}-horizon:${PROJECT_VERSION:-1.0.0}-prod"
+
+        restart: always
+
+        environment:
+            TZ: America/Sao_Paulo
+
+        volumes:
+            - ./../../.env:/var/www/.env
+            - public-storage:/var/www/storage/app/public:rw
+            - ./../../storage/app/backups:/var/www/storage/app/backups:rw
+            - ./../../storage/logs:/var/www/storage/logs:rw
+
+        networks:
+            - project-network
+
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
+
+        command: php artisan horizon
+
+        depends_on:
+            redis:
+                condition: service_healthy
+            db:
+                condition: service_healthy
+
+        healthcheck:
+            test: ["CMD", "php", "artisan", "horizon:status"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 30s
+
+        stop_signal: SIGTERM
+        stop_grace_period: 30s
+
+    scheduler:
+        container_name: "{{project-name}}-scheduler_prod"
+
+        # Metadados do container
+        labels:
+            - "com.{{project-name}}.project={{project-name}}"
+            - "com.{{project-name}}.service=scheduler"
+            - "com.{{project-name}}.environment=production"
+        build:
+            context: ./../..
+            dockerfile: docker/production/php-fpm/Dockerfile
+
+        image: "{{project-name}}-scheduler:${PROJECT_VERSION:-1.0.0}-prod"
+
+        restart: always
+
+        environment:
+            TZ: America/Sao_Paulo
+
+        volumes:
+            - ./../../.env:/var/www/.env
+            - public-storage:/var/www/storage/app/public:rw
+            - ./../../storage/app/backups:/var/www/storage/app/backups:rw
+            - ./../../storage/logs:/var/www/storage/logs:rw
+
+        networks:
+            - project-network
+
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
+
+        command: sh -c "while true; do php artisan schedule:run --verbose --no-interaction; sleep 60; done"
+
+        depends_on:
+            db:
+                condition: service_healthy
+
+        healthcheck:
+            test: ["CMD", "php", "-r", "echo 'ok';"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 20s
+
+    db:
+        image: mysql:8.4.3
+
+        container_name: "{{project-name}}-database_prod"
+
+        # Metadados do container
+        labels:
+            - "com.{{project-name}}.project={{project-name}}"
+            - "com.{{project-name}}.service=db"
+            - "com.{{project-name}}.environment=production"
+        restart: always
+
+        environment:
+            MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+            MYSQL_DATABASE: ${DB_DATABASE}
+            MYSQL_USER: ${DB_USERNAME}
+            MYSQL_PASSWORD: ${DB_PASSWORD}
+            TZ: America/Sao_Paulo
+
+        volumes:
+            - db-data:/var/lib/mysql
+
+        networks:
+            - project-network
+
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
+
+        ports:
+            # NOTE: definir uma porta que não estaja sendo utilizada na máquina
+            - "127.0.0.1:3307:3306"
+
+        healthcheck:
+            test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "--password=${DB_ROOT_PASSWORD}"]
+            interval: 10s
+            timeout: 5s
+            retries: 10
+            start_period: 40s
+
+    redis:
+        image: redis:8.2.1
+
+        container_name: "{{project-name}}-redis_prod"
+
+        # Metadados do container
+        labels:
+            - "com.{{project-name}}.project={{project-name}}"
+            - "com.{{project-name}}.service=redis"
+            - "com.{{project-name}}.environment=production"
+        command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 100mb --maxmemory-policy allkeys-lru
+
+        restart: always
+
+        environment:
+            TZ: America/Sao_Paulo
+
+        volumes:
+            - redis-data:/data
+
+        networks:
+            - project-network
+
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
+
+        ports:
+            # NOTE: definir uma porta que não estaja sendo utilizada na máquina
+            - "127.0.0.1:6380:6379"
+
+        healthcheck:
+            test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 20s
+
+volumes:
+    public-storage:
+        external: true
+        name: "{{project-name}}_public_storage"
+
+    db-data:
+        external: true
+        name: "{{project-name}}_db_data"
+
+    redis-data:
+        external: true
+        name: "{{project-name}}_redis_data"
+
+networks:
+    project-network:
+
+    proxy-network:
+        external: true

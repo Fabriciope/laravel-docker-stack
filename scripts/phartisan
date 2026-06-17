@@ -1,0 +1,42 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Lista os containers em execução
+# running_container=$(docker ps --format '{{.Names}}' | grep -E 'php-fpm_')
+running_container=$(docker ps --format '{{.Names}}' | grep -E '^{{project-name}}-php-fpm_(prod|dev)$' | head -n 1)
+
+# Se não encontrar nenhum container correspondente, aborta
+if [ -z "$running_container" ]; then
+  echo "Nenhum container php-fpm_<ambiente> está em execução."
+  exit 1
+fi
+
+# Extrai o ambiente a partir do nome do container
+env_suffix="${running_container#{{project-name}}-php-fpm_}"
+
+# Mapeia o sufixo para o nome do diretório de ambiente
+case "$env_suffix" in
+  dev)
+    ENV="development"
+    ;;
+  prod)
+    ENV="production"
+    ;;
+  *)
+    echo "Ambiente '$env_suffix' não reconhecido."
+    exit 1
+    ;;
+esac
+
+# Executa o comando Artisan dentro do container correto
+TTY_FLAG=""
+[[ -t 0 && -t 1 ]] && TTY_FLAG="-it" || TTY_FLAG=""
+
+docker compose \
+  --project-name "{{project-name}}_${ENV}" \
+  --file "$PROJECT_DIR/docker/${ENV}/docker-compose.yml" \
+  --env-file "$PROJECT_DIR/.env" \
+  exec $TTY_FLAG php-fpm php artisan "$@"

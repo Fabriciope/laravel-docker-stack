@@ -1,0 +1,743 @@
+#!/bin/bash
+
+# =============================================================================
+# Deploy Script - Laravel Application
+# =============================================================================
+# Usage: ./deploy <environment> [options]
+#
+# Environments:
+#   prod    Deploy to production environment
+#   dev     Deploy to development environment
+#
+# Options:
+#   --version <v>     Tag/version for a NEW deploy (prod only). Builds images
+#                     tagged <v>-prod. Without it, a normal prod deploy rebuilds
+#                     the current version (see .env PROJECT_VERSION).
+#   --rollback <v>    Roll back to a version already built/stored on disk (prod
+#                     only). Recreates containers from <v>-prod images WITHOUT
+#                     building. Does NOT revert database migrations.
+#   --list-versions   List prod image versions available on disk and exit.
+#   --git-pull        Pull latest changes from origin/main (production only)
+#   --skip-build      Skip docker image build; only recreate containers
+#   --first-deploy    Infrastructure setup and run key:generate + migrate --seed + storage:link (ln used) after containers start
+#   --dry-run         Print commands without executing them
+#   --help            Show this help message
+#
+# Versioning (prod): the image tag in docker/production/docker-compose.yml is
+# interpolated from PROJECT_VERSION. New deploys build+tag a new version and
+# keep the last N images for rollback; rollbacks reuse stored images (no build).
+# =============================================================================
+
+set -euo pipefail
+
+# --- Constants ----------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOGFILE="$PROJECT_DIR/storage/logs/deploy.log"
+ENV_FILE="$PROJECT_DIR/.env"
+
+TIMESTAMP=$(date +"%d-%m-%Y %H:%M:%S")
+VALID_ENVIRONMENTS=("prod" "dev")
+LOCKFILE="/tmp/deploy.lock"
+LOCK_FD=200
+
+GIT_PULL=false
+DRY_RUN=false
+SKIP_BUILD=false
+FIRST_DEPLOY=false
+
+# --- Versioning ---------------------------------------------------------------
+
+# How many image versions to keep on disk per service (older ones are pruned
+# after a successful new-version deploy). Configurable via PROJECT_VERSIONS_TO_KEEP
+# in .env; falls back to 5 when unset, empty or invalid (must be a positive int).
+KEEP_VERSIONS="$(grep -E '^PROJECT_VERSIONS_TO_KEEP=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+KEEP_VERSIONS="${KEEP_VERSIONS//[\"\' ]/}"
+[[ "$KEEP_VERSIONS" =~ ^[1-9][0-9]*$ ]] || KEEP_VERSIONS=5
+
+# Prod services built from a Dockerfile (build+image). These are the image
+# repositories that get versioned/tagged/pruned. The "-prod" suffix is appended
+# to the version to form the full tag, e.g. {{project-name}}-php-fpm:1.2.0-prod.
+PROD_IMAGE_REPOS=(
+    "{{project-name}}-web-server"
+    "{{project-name}}-php-fpm"
+    "{{project-name}}-horizon"
+    "{{project-name}}-scheduler"
+)
+# Canonical repo used to enumerate available versions in --list-versions.
+CANONICAL_REPO="{{project-name}}-php-fpm"
+
+VERSION=""           # --version value (new deploy)
+ROLLBACK_VERSION=""  # --rollback value (target stored version)
+DO_ROLLBACK=false
+LIST_VERSIONS=false
+
+# --- Colors -------------------------------------------------------------------
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# --- Command tracking ---------------------------------------------------------
+
+COMMANDS_LOG=()
+DEPLOY_STATUS="success"
+FAILED_OUTPUT=""
+
+# --- Functions ----------------------------------------------------------------
+
+show_help() {
+    echo -e "${BOLD}Usage:${NC} $0 <environment> [options]"
+    echo ""
+    echo -e "${BOLD}Environments:${NC}"
+    echo "  prod    Deploy to production environment"
+    echo "  dev     Deploy to development environment"
+    echo ""
+    echo -e "${BOLD}Options:${NC}"
+    echo "  --version <v>    Version/tag for a NEW prod deploy (builds <v>-prod images)"
+    echo "                   Without it, a normal prod deploy rebuilds the current version"
+    echo "  --rollback <v>   Recreate prod containers from stored <v>-prod images (no build)"
+    echo "                   Does NOT revert database migrations"
+    echo "  --list-versions  List prod image versions available on disk, then exit"
+    echo "  --git-pull       Pull latest changes from origin/main (prod only)"
+    echo "  --skip-build     Skip docker image build; only recreate containers"
+    echo "                   Useful when only .env changed or to restart containers"
+    echo "  --first-deploy   Infrastructure setup and run key:generate + migrate --seed + storage:link (ln used) after containers start"
+    echo "  --dry-run        Print commands without executing them (no changes will be made)"
+    echo "  --help           Show this help message"
+    echo ""
+    echo -e "${BOLD}Examples:${NC}"
+    echo "  $0 prod --version 1.2.0            # new deploy: build + tag 1.2.0-prod"
+    echo "  $0 prod --version 1.2.0 --git-pull # pull main, then build/deploy 1.2.0"
+    echo "  $0 prod                            # rebuild current version (from .env)"
+    echo "  $0 prod --list-versions            # show versions available for rollback"
+    echo "  $0 prod --rollback 1.1.0           # roll back to stored images 1.1.0-prod"
+    echo "  $0 prod --first-deploy             # first prod deploy (version from .env, or pass --version)"
+    echo "  $0 prod --skip-build"
+    echo "  $0 dev --first-deploy"
+}
+
+show_summary() {
+    local line
+    line=$(printf '═%.0s' $(seq 1 46))
+
+    echo ""
+    echo -e "${BOLD}${YELLOW}  ██████╗ ██╗   ██╗██████╗  ██████╗ ██╗   ██╗███████╗██████╗ ${RED}██████╗ ██╗ █████╗ ${NC}"
+    echo -e "${BOLD}${YELLOW}  ██╔══██╗██║   ██║██╔══██╗██╔════╝ ██║   ██║██╔════╝██╔══██╗${RED}██╔══██╗██║██╔══██╗${NC}"
+    echo -e "${BOLD}${YELLOW}  ██████╔╝██║   ██║██████╔╝██║  ███╗██║   ██║█████╗  ██████╔╝${RED}██████╔╝██║███████║${NC}"
+    echo -e "${BOLD}${YELLOW}  ██╔══██╗██║   ██║██╔══██╗██║   ██║██║   ██║██╔══╝  ██╔══██╗${RED}██╔══██╗██║██╔══██║${NC}"
+    echo -e "${BOLD}${YELLOW}  ██████╔╝╚██████╔╝██║  ██║╚██████╔╝╚██████╔╝███████╗██║  ██║${RED}██████╔╝██║██║  ██║${NC}"
+    echo -e "${BOLD}${YELLOW}  ╚═════╝  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝${RED}╚═════╝ ╚═╝╚═╝  ╚═╝${NC}"
+    echo ""
+
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+        echo -e "${GREEN}${BOLD}  ╔${line}╗${NC}"
+        echo -e "${GREEN}${BOLD}  ║   ✓  DEPLOY CONCLUIDO COM SUCESSO            ║${NC}"
+        echo -e "${GREEN}${BOLD}  ╚${line}╝${NC}"
+    else
+        echo -e "${RED}${BOLD}  ╔${line}╗${NC}"
+        echo -e "${RED}${BOLD}  ║   ✗  DEPLOY FALHOU                           ║${NC}"
+        echo -e "${RED}${BOLD}  ╚${line}╝${NC}"
+    fi
+
+    echo ""
+    echo -e "${BOLD}  Comandos executados:${NC}"
+
+    for entry in "${COMMANDS_LOG[@]}"; do
+        local status="${entry%%|*}"
+        local rest="${entry#*|}"
+        local desc="${rest%%|*}"
+
+        case "$status" in
+            OK)
+                echo -e "    ${GREEN}✓${NC}  $desc"
+                ;;
+            FAIL)
+                echo -e "    ${RED}✗${NC}  ${RED}${BOLD}$desc${NC}"
+                ;;
+            DRY)
+                echo -e "    ${YELLOW}~${NC}  $desc ${YELLOW}(dry-run)${NC}"
+                ;;
+        esac
+    done
+
+    if [[ "$DEPLOY_STATUS" == "failed" && -n "$FAILED_OUTPUT" ]]; then
+        echo ""
+        echo -e "  ${RED}${BOLD}Erro:${NC}"
+        while IFS= read -r err_line; do
+            echo -e "    ${RED}${err_line}${NC}"
+        done <<< "$FAILED_OUTPUT"
+    fi
+
+    echo ""
+}
+
+log() {
+    local level="$1"
+    local message="$2"
+    local log_timestamp
+    log_timestamp=$(date +"%d-%m-%Y %H:%M:%S")
+
+    case "$level" in
+        INFO)    echo -e "${CYAN}[INFO]${NC} $message" ;;
+        SUCCESS) echo -e "${GREEN}[SUCCESS]${NC} $message" ;;
+        ERROR)   echo -e "${RED}[ERROR]${NC} $message" ;;
+        WARN)    echo -e "${YELLOW}[WARN]${NC} $message" ;;
+    esac
+
+    if [[ "$DRY_RUN" == false ]]; then
+        echo "[$log_timestamp][$level] $message" >> "$LOGFILE"
+    fi
+}
+
+run_cmd() {
+    local cmd="$1"
+    local description="${2:-$cmd}"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} Would run: ${BOLD}$cmd${NC}"
+        COMMANDS_LOG+=("DRY|$description")
+        return 0
+    fi
+
+    log "INFO" "Running: $description"
+
+    local output
+    if output=$(eval "$cmd" 2>&1); then
+        echo "$output"
+        log "SUCCESS" "$description"
+        COMMANDS_LOG+=("OK|$description")
+    else
+        local status=$?
+        echo "$output"
+        log "ERROR" "Command failed: $description"
+        echo "$output" >> "$LOGFILE"
+        log "ERROR" "Stopping deployment due to error."
+        echo "" >> "$LOGFILE"
+        DEPLOY_STATUS="failed"
+        FAILED_OUTPUT="$output"
+        COMMANDS_LOG+=("FAIL|$description|$output")
+        exit $status
+    fi
+}
+
+validate_environment() {
+    local env="$1"
+    for valid in "${VALID_ENVIRONMENTS[@]}"; do
+        [[ "$env" == "$valid" ]] && return 0
+    done
+    return 1
+}
+
+acquire_lock() {
+    eval "exec $LOCK_FD>\"$LOCKFILE\""
+
+    if ! flock -n $LOCK_FD; then
+        echo -e "${RED}[ERROR]${NC} Another deploy is already running. Aborting."
+        echo -e "        If this is incorrect, remove the lock file manually: ${BOLD}rm -f $LOCKFILE${NC}"
+        exit 1
+    fi
+}
+
+cleanup() {
+    show_summary
+    flock -u $LOCK_FD 2>/dev/null || true
+    rm -f "$LOCKFILE" 2>/dev/null || true
+}
+
+# --- Versioning helpers -------------------------------------------------------
+
+# Reject anything that is not a valid docker tag fragment.
+validate_version_format() {
+    local v="$1"
+    if [[ ! "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo -e "${RED}Error:${NC} Invalid version '$v'. Use only letters, digits, '.', '_' and '-'."
+        exit 1
+    fi
+}
+
+# Read the current version pointer from .env (PROJECT_VERSION). Empty if absent.
+get_current_version() {
+    [[ -f "$ENV_FILE" ]] || return 0
+    grep -E '^PROJECT_VERSION=' "$ENV_FILE" 2>/dev/null \
+        | tail -n1 | cut -d= -f2- | tr -d '"'"'"
+}
+
+# Re-assert .env ownership/permissions so the php-fpm container (www-data) can
+# read it after a rewrite. The .env is bind-mounted into the prod containers and
+# `sed -i` replaces the file inode, dropping the www-data group (the deploy user
+# is not a member of it), which leaves www-data unable to read it. Mode 660 +
+# group www-data restores group access while keeping the secrets unreadable to
+# other host users. Group write (g+w) is required by `key:generate` on the first
+# deploy, which writes APP_KEY into .env from inside the container as www-data.
+enforce_env_permissions() {
+    [[ "$ENVIRONMENT" == "prod" ]] || return 0
+    [[ -f "$ENV_FILE" ]] || return 0
+
+    run_cmd "sudo chown :www-data \"$ENV_FILE\" && sudo chmod 660 \"$ENV_FILE\"" \
+        "Re-assert .env group (www-data) and permissions (660)"
+}
+
+# Upsert PROJECT_VERSION=<v> in .env (the current-version pointer).
+set_current_version() {
+    local v="$1"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} Would set ${BOLD}PROJECT_VERSION=$v${NC} in .env"
+        COMMANDS_LOG+=("DRY|Update .env pointer (PROJECT_VERSION=$v)")
+        return 0
+    fi
+
+    if grep -qE '^PROJECT_VERSION=' "$ENV_FILE" 2>/dev/null; then
+        sed -i -E "s|^PROJECT_VERSION=.*|PROJECT_VERSION=$v|" "$ENV_FILE"
+    else
+        printf '\nPROJECT_VERSION=%s\n' "$v" >> "$ENV_FILE"
+    fi
+
+    # The rewrite above replaces the file and drops the www-data group; restore
+    # it so the next container recreate can read the .env (otherwise REDIS_PASSWORD
+    # and friends come up empty and `optimize` fails to reach Redis).
+    enforce_env_permissions
+
+    log "SUCCESS" "Updated .env pointer: PROJECT_VERSION=$v"
+    COMMANDS_LOG+=("OK|Update .env pointer (PROJECT_VERSION=$v)")
+}
+
+# List prod image versions on disk (newest first) and mark the current one.
+list_versions() {
+    local current
+    current="$(get_current_version)"
+
+    echo ""
+    echo -e "${BOLD}Prod image versions available on disk:${NC}"
+    echo ""
+
+    local found=false
+    while IFS='|' read -r tag created; do
+        [[ -z "$tag" ]] && continue
+        found=true
+        local ver="${tag%-prod}"
+        local marker=""
+        [[ "$ver" == "$current" ]] && marker="  ${GREEN}(current)${NC}"
+        printf "  ${BOLD}%-14s${NC} %s${marker}\n" "$ver" "${created:0:16}"
+    done < <(docker images --filter="reference=${CANONICAL_REPO}:*-prod" --format '{{.Tag}}|{{.CreatedAt}}')
+
+    if [[ "$found" == false ]]; then
+        echo -e "  ${YELLOW}No versioned images found.${NC}"
+    fi
+
+    echo ""
+    echo -e "  Roll back with: ${BOLD}$0 prod --rollback <version>${NC}"
+    echo ""
+}
+
+# Ensure every prod service has an image for the requested rollback version.
+validate_rollback_images() {
+    local v="$1"
+    local missing=()
+
+    for repo in "${PROD_IMAGE_REPOS[@]}"; do
+        if ! docker image inspect "${repo}:${v}-prod" > /dev/null 2>&1; then
+            missing+=("${repo}:${v}-prod")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "${RED}Error:${NC} Cannot roll back to '$v' — missing images:"
+        for m in "${missing[@]}"; do
+            echo -e "    ${RED}·${NC} $m"
+        done
+        echo ""
+        echo -e "  Run ${BOLD}$0 prod --list-versions${NC} to see available versions."
+        exit 1
+    fi
+}
+
+# Keep the newest KEEP_VERSIONS images per prod repo; remove older ones.
+# Images currently in use by containers are skipped by `docker rmi` (no -f).
+prune_old_images() {
+    log "INFO" "Prune: keeping the $KEEP_VERSIONS most recent versions per service..."
+
+    for repo in "${PROD_IMAGE_REPOS[@]}"; do
+        local tags=()
+        mapfile -t tags < <(docker images --filter="reference=${repo}:*-prod" --format '{{.Tag}}')
+
+        (( ${#tags[@]} <= KEEP_VERSIONS )) && continue
+
+        local stale=("${tags[@]:$KEEP_VERSIONS}")
+        for tag in "${stale[@]}"; do
+            if [[ "$DRY_RUN" == true ]]; then
+                echo -e "${YELLOW}[DRY-RUN]${NC} Would remove image: ${BOLD}${repo}:${tag}${NC}"
+                COMMANDS_LOG+=("DRY|Prune image ${repo}:${tag}")
+            elif docker rmi "${repo}:${tag}" > /dev/null 2>&1; then
+                log "INFO" "Removed old image: ${repo}:${tag}"
+                COMMANDS_LOG+=("OK|Prune image ${repo}:${tag}")
+            else
+                log "WARN" "Could not remove ${repo}:${tag} (in use?). Skipping."
+            fi
+        done
+    done
+}
+
+# --- Argument Parsing ---------------------------------------------------------
+
+if [[ $# -eq 0 ]]; then
+    echo -e "${RED}Error:${NC} No arguments provided.\n"
+    show_help
+    exit 1
+fi
+
+ENVIRONMENT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help)
+            show_help
+            exit 0
+            ;;
+        --git-pull)
+            GIT_PULL=true
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            ;;
+        --skip-build)
+            SKIP_BUILD=true
+            ;;
+        --first-deploy)
+            FIRST_DEPLOY=true
+            ;;
+        --list-versions)
+            LIST_VERSIONS=true
+            ;;
+        --version)
+            shift
+            if [[ $# -eq 0 || "$1" == -* ]]; then
+                echo -e "${RED}Error:${NC} --version requires a value (e.g. --version 1.2.0)"
+                exit 1
+            fi
+            VERSION="$1"
+            ;;
+        --version=*)
+            VERSION="${1#*=}"
+            ;;
+        --rollback)
+            DO_ROLLBACK=true
+            if [[ $# -gt 1 && "$2" != -* ]]; then
+                shift
+                ROLLBACK_VERSION="$1"
+            fi
+            ;;
+        --rollback=*)
+            DO_ROLLBACK=true
+            ROLLBACK_VERSION="${1#*=}"
+            ;;
+        -*)
+            echo -e "${RED}Error:${NC} Unknown option: $1"
+            echo ""
+            show_help
+            exit 1
+            ;;
+        *)
+            if [[ -z "$ENVIRONMENT" ]]; then
+                ENVIRONMENT="$1"
+            else
+                echo -e "${RED}Error:${NC} Unexpected argument: $1"
+                echo ""
+                show_help
+                exit 1
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [[ -z "$ENVIRONMENT" ]]; then
+    echo -e "${RED}Error:${NC} Environment not specified.\n"
+    show_help
+    exit 1
+fi
+
+if ! validate_environment "$ENVIRONMENT"; then
+    echo -e "${RED}Error:${NC} Invalid environment: '${ENVIRONMENT}'"
+    echo "Valid environments: ${VALID_ENVIRONMENTS[*]}"
+    exit 1
+fi
+
+# --- Versioning validation ----------------------------------------------------
+
+# Versioning/rollback features are production-only.
+if [[ "$ENVIRONMENT" != "prod" ]]; then
+    if [[ -n "$VERSION" || "$DO_ROLLBACK" == true || "$LIST_VERSIONS" == true ]]; then
+        echo -e "${RED}Error:${NC} --version / --rollback / --list-versions are available for 'prod' only."
+        exit 1
+    fi
+fi
+
+# --list-versions is read-only: print and exit (no lock, no deploy).
+if [[ "$LIST_VERSIONS" == true ]]; then
+    list_versions
+    exit 0
+fi
+
+# --rollback and --version are mutually exclusive.
+if [[ "$DO_ROLLBACK" == true && -n "$VERSION" ]]; then
+    echo -e "${RED}Error:${NC} --rollback and --version cannot be used together."
+    exit 1
+fi
+
+if [[ "$DO_ROLLBACK" == true ]]; then
+    if [[ -z "$ROLLBACK_VERSION" ]]; then
+        echo -e "${RED}Error:${NC} --rollback requires a version (e.g. --rollback 1.1.0)."
+        echo -e "        Run ${BOLD}$0 prod --list-versions${NC} to see available versions."
+        exit 1
+    fi
+    validate_version_format "$ROLLBACK_VERSION"
+
+    if [[ "$GIT_PULL" == true || "$FIRST_DEPLOY" == true ]]; then
+        echo -e "${RED}Error:${NC} --rollback cannot be combined with --git-pull or --first-deploy."
+        exit 1
+    fi
+fi
+
+# New deploy: validate --version when provided. It is optional even on
+# --first-deploy — when omitted, prod falls back to the current version pointer
+# in .env (PROJECT_VERSION, default 1.0.0).
+if [[ -n "$VERSION" ]]; then
+    validate_version_format "$VERSION"
+fi
+
+# --- Lock + Summary Trap ------------------------------------------------------
+
+if [[ "$DRY_RUN" == false ]]; then
+    acquire_lock
+fi
+trap cleanup EXIT
+
+# --- Pre-flight Checks --------------------------------------------------------
+
+if [[ "$DRY_RUN" == false ]]; then
+    if [[ ! -f "$LOGFILE" ]]; then
+        mkdir -p "$(dirname "$LOGFILE")"
+        touch "$LOGFILE"
+    fi
+
+    if [[ ! -x "$SCRIPT_DIR/dockerbuild" ]]; then
+        echo -e "${RED}Error:${NC} '$SCRIPT_DIR/dockerbuild' not found or not executable."
+        exit 1
+    fi
+
+    if [[ ! -x "$SCRIPT_DIR/phartisan" ]]; then
+        echo -e "${RED}Error:${NC} '$SCRIPT_DIR/phartisan' not found or not executable."
+        exit 1
+    fi
+fi
+
+# --- Deploy -------------------------------------------------------------------
+
+if [[ "$DRY_RUN" == true ]]; then
+    echo ""
+    echo -e "${YELLOW}${BOLD}[DRY-RUN MODE] No commands will be executed.${NC}"
+    echo ""
+fi
+
+if [[ "$DRY_RUN" == false ]]; then
+    echo "" >> "$LOGFILE"
+    echo "===============================" >> "$LOGFILE"
+fi
+
+log "INFO" "Deployment started at: $TIMESTAMP"
+log "INFO" "Environment: $ENVIRONMENT"
+
+if [[ "$FIRST_DEPLOY" == true && "$DRY_RUN" == true ]]; then
+    log "INFO" "Flag --first-deploy detected. Infrastructure setup skipped in dry-run mode:"
+    if [[ "$ENVIRONMENT" == "prod" ]]; then
+        echo -e "         ${YELLOW}·${NC} Set .env group to www-data with permissions 660 (required for key:generate)"
+    fi
+    echo -e "         ${YELLOW}·${NC} Create log directories (storage/logs/nginx, storage/logs/php-fpm)"
+    echo -e "         ${YELLOW}·${NC} Create log files (nginx, php-fpm, laravel, deploy)"
+    echo -e "         ${YELLOW}·${NC} Set log file permissions (chmod 666)"
+    if [[ "$ENVIRONMENT" == "prod" ]]; then
+        echo -e "         ${YELLOW}·${NC} Create Docker volumes ({{project-name}}_public_storage, {{project-name}}_db_data, {{project-name}}_redis_data)"
+    else
+        echo -e "         ${YELLOW}·${NC} Skip external volumes (development uses local named volumes)"
+    fi
+    echo -e "         ${YELLOW}·${NC} Create storage symlink (public/storage -> storage/app/public)"
+    echo -e "         ${YELLOW}·${NC} Create storage/app/backups directory (bind mount for spatie/laravel-backup)"
+fi
+
+if [[ "$FIRST_DEPLOY" == true && "$DRY_RUN" == false ]]; then
+    log "INFO" "Flag --first-deploy detected. Running infrastructure setup..."
+
+    if [[ "$ENVIRONMENT" == "prod" ]]; then
+        enforce_env_permissions
+    fi
+
+    LOG_DIRS=(
+        "$PROJECT_DIR/storage/logs/nginx"
+        "$PROJECT_DIR/storage/logs/php-fpm"
+    )
+    for dir in "${LOG_DIRS[@]}"; do
+        if [[ -d "$dir" ]]; then
+            log "INFO" "Log directory '${dir#"$PROJECT_DIR/"}' already exists, skipping."
+        else
+            run_cmd "mkdir -p \"$dir\"" "Create log directory: ${dir#"$PROJECT_DIR/"}"
+        fi
+    done
+
+    LOG_FILES=(
+        "$PROJECT_DIR/storage/logs/nginx/access.log"
+        "$PROJECT_DIR/storage/logs/nginx/error.log"
+        "$PROJECT_DIR/storage/logs/php-fpm/php-fpm.log"
+        "$PROJECT_DIR/storage/logs/php-fpm/www.access.log"
+        "$PROJECT_DIR/storage/logs/php-fpm/www.app.log"
+        "$PROJECT_DIR/storage/logs/laravel.log"
+        "$PROJECT_DIR/storage/logs/deploy.log"
+    )
+
+    if [[ "$ENVIRONMENT" == "dev" ]]; then
+        LOG_FILES+=("$PROJECT_DIR/storage/logs/php-fpm/xdebug.log")
+    fi
+    for file in "${LOG_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            log "INFO" "Log file '${file#"$PROJECT_DIR/"}' already exists, skipping."
+        else
+            run_cmd "touch \"$file\"" "Create log file: ${file#"$PROJECT_DIR/"}"
+        fi
+    done
+
+    run_cmd "sudo chmod 666 \
+        \"$PROJECT_DIR/storage/logs/nginx/\"*.log \
+        \"$PROJECT_DIR/storage/logs/php-fpm/\"*.log \
+        \"$PROJECT_DIR/storage/logs/laravel.log\"" \
+        "Set log file permissions"
+
+    if [[ "$ENVIRONMENT" == "prod" ]]; then
+        for volume in {{project-name}}_public_storage {{project-name}}_db_data {{project-name}}_redis_data; do
+            if docker volume inspect "$volume" > /dev/null 2>&1; then
+                log "INFO" "Docker volume '$volume' already exists, skipping."
+            else
+                run_cmd "docker volume create --driver local $volume" "Create Docker volume: $volume"
+            fi
+        done
+    else
+        log "INFO" "Skipping external volume creation (development uses local named volumes)."
+    fi
+
+    if [[ -L "$PROJECT_DIR/public/storage" ]]; then
+        log "INFO" "Symlink public/storage already exists, skipping."
+    else
+        run_cmd "ln -s \"../storage/app/public\" \"$PROJECT_DIR/public/storage\"" \
+            "Create storage symlink (public/storage -> storage/app/public)"
+    fi
+
+    # spatie/laravel-backup writes here from inside the php-fpm/scheduler container
+    # (www-data). This host dir is bind-mounted into those containers, so it must
+    # exist before they start and be writable by www-data (uid matches the deploy user).
+    if [[ -d "$PROJECT_DIR/storage/app/backups" ]]; then
+        log "INFO" "Directory 'storage/app/backups' already exists, skipping."
+    else
+        run_cmd "mkdir -p \"$PROJECT_DIR/storage/app/backups\"" "Create storage/app/backups directory"
+    fi
+
+    if [[ "$ENVIRONMENT" == "dev" ]]; then
+        if ! grep -q "{{project-name}}.local" /etc/hosts 2>/dev/null; then
+            log "WARN" "Entrada /etc/hosts ausente. Adicione manualmente:"
+            log "WARN" "  echo '127.0.0.1 {{project-name}}.local' | sudo tee -a /etc/hosts"
+        else
+            log "INFO" "Entrada {{project-name}}.local já presente em /etc/hosts."
+        fi
+    fi
+fi
+
+# --- Version resolution (prod) ------------------------------------------------
+
+# Decide which image tag this run targets and export PROJECT_VERSION so the
+# compose file (image: ...:${PROJECT_VERSION}-prod) is interpolated for every
+# dockerbuild call below. Dev keeps its static tags and needs nothing here.
+if [[ "$ENVIRONMENT" == "prod" ]]; then
+    if [[ "$DO_ROLLBACK" == true ]]; then
+        DEPLOY_VERSION="$ROLLBACK_VERSION"
+    elif [[ -n "$VERSION" ]]; then
+        DEPLOY_VERSION="$VERSION"
+    else
+        # No --version on a normal deploy: rebuild the current version.
+        DEPLOY_VERSION="$(get_current_version)"
+        if [[ -z "$DEPLOY_VERSION" ]]; then
+            log "ERROR" "No --version given and no current version in .env (PROJECT_VERSION)."
+            echo -e "${RED}Error:${NC} Specify a version: ${BOLD}$0 prod --version <v>${NC}"
+            exit 1
+        fi
+        log "INFO" "No --version given; rebuilding current version: $DEPLOY_VERSION"
+    fi
+    export PROJECT_VERSION="$DEPLOY_VERSION"
+    log "INFO" "Target image version: ${DEPLOY_VERSION}-prod"
+fi
+
+# --- Rollback or normal deploy ------------------------------------------------
+
+if [[ "$DO_ROLLBACK" == true ]]; then
+    log "INFO" "Rollback requested -> version $ROLLBACK_VERSION (no image build)."
+
+    if [[ "$DRY_RUN" == false ]]; then
+        validate_rollback_images "$ROLLBACK_VERSION"
+    fi
+
+    run_cmd "$SCRIPT_DIR/dockerbuild $ENVIRONMENT up --no-build --force-recreate --detach --remove-orphans" \
+        "Rollback -> recreate containers from stored images (${ROLLBACK_VERSION}-prod)"
+
+    set_current_version "$ROLLBACK_VERSION"
+
+    run_cmd "$SCRIPT_DIR/phartisan optimize:clear" "Artisan optimize:clear"
+    run_cmd "$SCRIPT_DIR/phartisan optimize" "Artisan optimize"
+else
+    if [[ "$ENVIRONMENT" == "prod" && "$GIT_PULL" == true ]]; then
+        log "INFO" "Flag --git-pull detected. Pulling latest changes..."
+        run_cmd "git pull origin main" "git pull origin main"
+    elif [[ "$GIT_PULL" == true && "$ENVIRONMENT" != "prod" ]]; then
+        log "WARN" "--git-pull flag is ignored outside of production."
+    fi
+
+    if [[ "$SKIP_BUILD" == false ]]; then
+        run_cmd "$SCRIPT_DIR/dockerbuild $ENVIRONMENT build" "Building new image for $ENVIRONMENT"
+    else
+        log "INFO" "Flag --skip-build detected. Skipping image build."
+    fi
+
+    run_cmd "$SCRIPT_DIR/dockerbuild $ENVIRONMENT up --force-recreate --detach --remove-orphans" "Recreating containers -> docker compose up"
+
+    if [[ "$FIRST_DEPLOY" == true ]]; then
+        run_cmd "$SCRIPT_DIR/phartisan key:generate" "Artisan key:generate"
+        run_cmd "$SCRIPT_DIR/phartisan migrate --seed --force" "Artisan migrate --seed"
+    fi
+
+    run_cmd "$SCRIPT_DIR/phartisan optimize:clear" "Artisan optimize:clear"
+    run_cmd "$SCRIPT_DIR/phartisan optimize" "Artisan optimize"
+
+    # Persist the current-version pointer and prune old images (prod only).
+    if [[ "$ENVIRONMENT" == "prod" ]]; then
+        set_current_version "$DEPLOY_VERSION"
+        prune_old_images
+    fi
+fi
+
+# --- Done ---------------------------------------------------------------------
+
+TIMESTAMP=$(date +"%d-%m-%Y %H:%M:%S")
+log "SUCCESS" "Application deployed successfully at $TIMESTAMP"
+
+if [[ "$DO_ROLLBACK" == true ]]; then
+    echo ""
+    echo -e "${YELLOW}${BOLD}  ⚠  AVISO — Rollback de imagem apenas${NC}"
+    echo -e "${YELLOW}     O código/imagem foi revertido para ${BOLD}${ROLLBACK_VERSION}${NC}${YELLOW}, mas as MIGRATIONS"
+    echo -e "     do banco NÃO foram revertidas. Se a versão anterior aplicou migrations"
+    echo -e "     incompatíveis, avalie manualmente (ex.: backup + migrate:rollback).${NC}"
+fi
+
+if [[ "$DRY_RUN" == false ]]; then
+    echo "" >> "$LOGFILE"
+fi
