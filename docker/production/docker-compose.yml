@@ -27,8 +27,9 @@ services:
         volumes:
             # public/ NÃO é bind mount: vem embutido na imagem (Dockerfile do nginx
             # copia os assets do Vite e cria o symlink public/storage). Isso preserva
-            # a imutabilidade da imagem e o rollback por versão.
-            - public-storage:/var/www/storage/app/public:ro
+            # a imutabilidade da imagem e o rollback por versão. Os uploads
+            # (storage/app/public) vêm do host via bind mount, somente leitura.
+            - ./../../storage/app/public:/var/www/storage/app/public:ro
             - ./../../storage/logs:/var/www/storage/logs:rw
 
         # Portas 80 e 443 removidas do bindding, pois o Traefik é o único ponto de entrada externo
@@ -105,8 +106,11 @@ services:
 
         volumes:
             - ./../../.env:/var/www/.env
-            - public-storage:/var/www/storage/app/public:rw
-            - ./../../storage/app/backups:/var/www/storage/app/backups:rw
+            # storage/app inteiro persistido no host (bind mount): uploads públicos
+            # (servidos pelo nginx), arquivos privados (disco `local`) e backups do
+            # spatie sobrevivem ao recreate dos containers. storage/framework fica
+            # DENTRO do container de propósito (cache compilado por versão de imagem).
+            - ./../../storage/app:/var/www/storage/app:rw
             - ./../../storage/logs:/var/www/storage/logs:rw
 
         networks:
@@ -153,8 +157,11 @@ services:
 
         volumes:
             - ./../../.env:/var/www/.env
-            - public-storage:/var/www/storage/app/public:rw
-            - ./../../storage/app/backups:/var/www/storage/app/backups:rw
+            # storage/app inteiro persistido no host (bind mount): uploads públicos
+            # (servidos pelo nginx), arquivos privados (disco `local`) e backups do
+            # spatie sobrevivem ao recreate dos containers. storage/framework fica
+            # DENTRO do container de propósito (cache compilado por versão de imagem).
+            - ./../../storage/app:/var/www/storage/app:rw
             - ./../../storage/logs:/var/www/storage/logs:rw
 
         networks:
@@ -205,8 +212,11 @@ services:
 
         volumes:
             - ./../../.env:/var/www/.env
-            - public-storage:/var/www/storage/app/public:rw
-            - ./../../storage/app/backups:/var/www/storage/app/backups:rw
+            # storage/app inteiro persistido no host (bind mount): uploads públicos
+            # (servidos pelo nginx), arquivos privados (disco `local`) e backups do
+            # spatie sobrevivem ao recreate dos containers. storage/framework fica
+            # DENTRO do container de propósito (cache compilado por versão de imagem).
+            - ./../../storage/app:/var/www/storage/app:rw
             - ./../../storage/logs:/var/www/storage/logs:rw
 
         networks:
@@ -314,10 +324,6 @@ services:
             start_period: 20s
 
 volumes:
-    public-storage:
-        external: true
-        name: "{{project-name}}_public_storage"
-
     db-data:
         external: true
         name: "{{project-name}}_db_data"

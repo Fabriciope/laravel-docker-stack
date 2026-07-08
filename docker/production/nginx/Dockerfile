@@ -21,12 +21,14 @@ COPY --from=node-build-stage /app/public/build/ /var/www/public/build/
 
 WORKDIR /var/www/public
 
-# Symlink public/storage -> ../storage/app/public embutido na imagem (alvo é o volume
-# public-storage montado em runtime). Garante que o Nginx sirva /storage/* sem bind mount.
-RUN ln -snf ../storage/app/public /var/www/public/storage \
-    && chown -R nginx:nginx /var/www/public \
-    && mkdir -p /var/www/storage/logs/nginx \
-    && chown -R nginx:nginx /var/www/storage/logs
+# storage/ está no .dockerignore, então o COPY . /var/www acima NÃO trouxe storage.
+# Recriamos o esqueleto que o Nginx precisa: storage/app/public é o alvo do symlink
+# abaixo (recebe o bind mount :ro de ./storage/app/public em runtime) e storage/logs/nginx
+# recebe os access/error logs via bind mount. Ambos ficam vazios na imagem — o conteúdo
+# vem dos mounts. Sem o mkdir, o symlink ficaria pendurado e o dir de logs não existiria.
+RUN mkdir -p /var/www/storage/app/public /var/www/storage/logs/nginx \
+    && ln -snf ../storage/app/public /var/www/public/storage \
+    && chown -R nginx:nginx /var/www/public /var/www/storage
 
 # Metadados da imagem (padrão OCI)
 LABEL org.opencontainers.image.title="{{project-name}} — Nginx" \

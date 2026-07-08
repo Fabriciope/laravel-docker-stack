@@ -29,5 +29,13 @@ db-backup/
 # .env real sobrescreveria a config de runtime e quebraria o app.
 /bootstrap/cache/*.php
 
+# storage/ NUNCA entra na imagem: contém dados de runtime do HOST (dumps do banco em
+# app/backups, logs, uploads em app/public, arquivos privados em app/private). Sem esta
+# linha, o `COPY . .` assaria esses dados em cada versão de imagem — vazamento do banco
+# inteiro, extraível com `docker save` de qualquer tag. O esqueleto vazio necessário
+# (app/, framework/, logs/) é recriado nos Dockerfiles; o dado real vem dos bind mounts
+# de runtime (./storage/app, ./storage/logs). Ver docker/README.md › Volumes.
+/storage
+
 # Banco SQLite de dev — produção usa MySQL; não deve entrar na imagem.
 /database/*.sqlite

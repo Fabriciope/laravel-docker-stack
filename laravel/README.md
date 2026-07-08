@@ -22,7 +22,7 @@ tem (não dá para sobrescrever esses).
 | `laravel/horizon` | Workers + dashboard das filas sobre Redis. A stack roda um container `horizon` dedicado. |
 | `laravel/pulse` | Dashboard de métricas de performance da aplicação. |
 | `opcodesio/log-viewer` | Lê os logs (bind-montados em `storage/logs`) pelo navegador em `/log-viewer`. |
-| `spatie/laravel-backup` | Dump agendado do banco; roda no container `scheduler` e grava no volume de backups. |
+| `spatie/laravel-backup` | Dump agendado do banco; roda no container `scheduler` e grava em `storage/app/backups` (bind mount no host). |
 
 > [!IMPORTANT]
 > Esses pacotes precisam estar no `composer.json`/`composer.lock` **antes de subir** — em

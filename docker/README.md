@@ -100,8 +100,8 @@ middlewares `ratelimit`, `hsts`, `compress`) ficam neste serviço, no compose de
 
 ### `php-fpm`
 
-Executa a aplicação. Monta o `.env`, o volume `public-storage`, `storage/app/backups` e
-`storage/logs`. Healthcheck via `cgi-fcgi -bind -connect 127.0.0.1:9000`. É o container que os
+Executa a aplicação. Monta o `.env`, `storage/app` (inteiro) e `storage/logs` — todos bind
+mounts. Healthcheck via `cgi-fcgi -bind -connect 127.0.0.1:9000`. É o container que os
 scripts `phartisan`/`phcomposer` acessam.
 
 ### `horizon`
@@ -177,6 +177,13 @@ docker inspect -f '{{ json .Config.Labels }}' {{project-name}}-php-fpm_prod
 1. **Stage Node** (`node:20-alpine`) — `npm ci` + `npm run build` geram os assets do Vite.
 2. **Stage PHP** (`php:8.4.6-fpm`) — instala extensões (`pdo_mysql`, `redis`, `ds`, `gd`,
    `intl`, `bcmath`, `pcntl`, `soap`, `zip`), aplica os overrides de `php.ini`/`php-fpm` e:
+   - **`pecl channel-update pecl.php.net` antes do `pecl install`:** o índice do canal embutido
+     na imagem base fica desatualizado e faz o pecl não resolver versões novas das extensões,
+     abortando o build com `'<ext>' does not exist` no `docker-php-ext-enable`. Atualizar o
+     índice antes de instalar garante builds reproduzíveis.
+   - **OPcache é habilitado** (`docker-php-ext-enable opcache`): na imagem oficial `php:fpm` ele
+     vem compilado mas **desabilitado** — sem habilitá-lo, toda a tunagem de `opcache.*` do
+     `99-overrides.ini` de produção fica inerte.
    - **Cache de camadas do Composer:** copia só `composer.json`/`composer.lock` e roda
      `composer install --no-scripts` **antes** do `COPY . .`. Assim o `install` só re-executa
      quando as dependências mudam, não a cada alteração de código. O `package:discover` (do
@@ -184,6 +191,10 @@ docker inspect -f '{{ json .Config.Labels }}' {{project-name}}-php-fpm_prod
    - **`COPY . .`** embute o código na imagem — origem da imutabilidade e do
      [rollback por versão](#imagens-versionadas).
    - Copia `public/build/` do stage Node e cria o symlink `public/storage → ../storage/app/public`.
+   - **Recria o esqueleto de `storage/`** (excluído pelo `.dockerignore`): `app/` e `logs/` como
+     pontos de montagem vazios (o conteúdo vem dos bind mounts de runtime), e `framework/`
+     **de fato** — não é montado e é usado de dentro da imagem (cache compilado, sessões, views),
+     então precisa existir antes do `package:discover`, senão o app quebra na primeira view.
    - **Remove caches compilados** (`bootstrap/cache/*.php`): um `config.php` assado sem o `.env`
      real sobrescreveria a config de runtime e quebraria o app. O cache correto é gerado pelo
      `optimize` do deploy, já com o `.env` montado.
@@ -198,7 +209,9 @@ symlink de storage e ajusta o dono — para servir tudo sem bind mount do host.
 `docker/development/php-fpm/Dockerfile`:
 
 - Usa `php.ini-development` e adiciona **Xdebug** (porta 9003, conecta ao IDE via
-  `host.docker.internal`, resolvido por `extra_hosts` no compose).
+  `host.docker.internal`, resolvido por `extra_hosts` no compose). Como em produção, roda
+  `pecl channel-update` antes do `pecl install` — sem isso o pecl não resolve o Xdebug e o
+  build falha com `'xdebug' does not exist`.
 - **Alinha o UID/GID** do `www-data` ao usuário do host (`HOST_UID`/`HOST_GID`, padrão 1000)
   para o php-fpm conseguir escrever nos arquivos bind-mounted sem erro de permissão.
 - Um **entrypoint** roda `composer install` automaticamente no primeiro start, caso `vendor/`
@@ -212,6 +225,12 @@ acontecer ao mudar o `Dockerfile`/extensões.
 Mantém o contexto de build enxuto e seguro: exclui `vendor/`, `node_modules/`, `.env*` (exceto
 `.env.example`), `.git`, `scripts/`, os caches compilados (`bootstrap/cache/*.php`) e o SQLite
 de dev.
+
+Também exclui **`/storage` inteiro** — dados de runtime do host (dumps do banco em
+`app/backups`, logs, uploads) **nunca** devem ser assados na imagem: sem essa exclusão, o
+`COPY . .` embutiria o banco inteiro em cada versão de imagem, extraível com `docker save` de
+qualquer tag. O **esqueleto vazio** que o Laravel precisa é recriado no Dockerfile (ver
+[Build das imagens](#build-das-imagens)); o dado real vem dos bind mounts de runtime.
 
 ---
 
@@ -291,15 +310,20 @@ Em produção, os dados ficam em **volumes externos** (criados no `--first-deplo
 |---|---|---|
 | `{{project-name}}_db_data` | volume externo | dados do MySQL |
 | `{{project-name}}_redis_data` | volume externo | dump do Redis |
-| `{{project-name}}_public_storage` | volume externo | uploads públicos (`storage/app/public`), compartilhado entre os containers |
 | `./.env` | bind mount | config e segredos (fora da imagem) |
+| `./storage/app` | bind mount | uploads públicos (`app/public`, servidos pelo nginx via sub-mount `:ro`), arquivos privados (`app/private`, disco `local`) e dumps do banco (`app/backups`, spatie) |
 | `./storage/logs` | bind mount | logs de todos os containers |
-| `./storage/app/backups` | bind mount | dumps do banco (spatie) |
 
 > **`public/` não é bind mount em produção** — é embutido na imagem (código + assets + symlink de
 > storage). Isso preserva a imutabilidade da imagem e o rollback por versão. O único conteúdo
-> dinâmico de `public/` são os uploads, servidos via volume `public-storage` montado em
-> `storage/app/public`.
+> dinâmico de `public/` são os uploads, servidos via bind mount de `storage/app/public`.
+>
+> **`storage/framework` fica dentro do container de propósito** — é cache compilado
+> (views/config/rotas), deve viver e morrer com a versão da imagem. Persistir isso entre
+> deploys reintroduziria cache velho após um rollback. Todo o **dado real** de `storage/`
+> (`app/` e `logs/`) está em bind mount e sobrevive ao recreate. As permissões de
+> `storage/app` (dono `www-data` uid 33, dirs `2775` com setgid) são aplicadas pelo
+> `deploy --first-deploy`.
 
 Em **desenvolvimento**, os volumes são **locais** (`db-data`, `redis-data`, `mailpit-data`,
 descartáveis com `docker compose down -v`) e o código-fonte inteiro é bind-mounted em `/var/www`.

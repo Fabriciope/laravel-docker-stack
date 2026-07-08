@@ -10,6 +10,10 @@ RUN mv "${PHP_INI_DIR}/php.ini-development" "${PHP_INI_DIR}/php.ini" && rm "${PH
 COPY docker/development/php-fpm/99-overrides.ini /usr/local/etc/php/conf.d/99-overrides.ini
 COPY docker/development/php-fpm/php-fpm-overrides.conf /usr/local/etc/php-fpm.d/zzz-app.conf
 
+# pecl channel-update: o índice do canal pecl.php.net vem embutido (e desatualizado) na
+# imagem base php:8.4.6-fpm. Sem refazê-lo, o pecl não resolve versões novas das extensões
+# e o build morre com "'xdebug' does not exist" no docker-php-ext-enable. opcache é bundled
+# na imagem oficial php:fpm (vem compilado mas DESABILITADO), por isso abaixo é só habilitado.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         zip \
         unzip \
@@ -24,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libfreetype6-dev \
         libfcgi-bin \
         default-mysql-client \
+    && pecl channel-update pecl.php.net \
     && pecl install \
         ds \
         redis \
@@ -31,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && docker-php-ext-enable \
         ds \
         redis \
-	opcache \
+        opcache \
         xdebug \
     && docker-php-ext-configure gd \
         --with-freetype \

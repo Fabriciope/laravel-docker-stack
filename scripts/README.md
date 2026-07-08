@@ -126,9 +126,12 @@ final, roda `key:generate` e `migrate --seed --force`. Passos:
 - Ajusta dono/permissões do `.env` para `www-data` (`chmod 660`) — **só em prod**.
 - Cria `storage/logs/{nginx,php-fpm}` e os arquivos de log (`nginx/access|error`,
   `php-fpm/php-fpm|www.access|www.app`, `laravel`, `deploy`; + `xdebug` em dev) com `chmod 666`.
-- **Prod:** cria os volumes externos (`{{project-name}}_public_storage`, `{{project-name}}_db_data`,
-  `{{project-name}}_redis_data`). **Dev:** usa volumes locais, então pula esse passo.
-- Cria o symlink `public/storage → ../storage/app/public` e o diretório `storage/app/backups`.
+- **Prod:** cria os volumes externos (`{{project-name}}_db_data`, `{{project-name}}_redis_data`).
+  **Dev:** usa volumes locais, então pula esse passo.
+- Cria o symlink `public/storage → ../storage/app/public` e o esqueleto de `storage/app`
+  (`public/`, `private/`, `backups/`) — o diretório inteiro é bind mount dos containers.
+- **Prod:** ajusta dono/permissões de `storage/app` (`www-data` uid 33, dirs `2775` com
+  setgid, arquivos `664`) para o container escrever e o host continuar lendo.
 - **Dev:** avisa se a entrada `{{project-name}}.local` estiver faltando no `/etc/hosts`.
 
 > Quer ver exatamente o que ele faria sem executar? `./scripts/deploy prod --first-deploy --dry-run`.

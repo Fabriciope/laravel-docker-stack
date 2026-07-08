@@ -553,12 +553,15 @@ if [[ "$FIRST_DEPLOY" == true && "$DRY_RUN" == true ]]; then
     echo -e "         ${YELLOW}·${NC} Create log files (nginx, php-fpm, laravel, deploy)"
     echo -e "         ${YELLOW}·${NC} Set log file permissions (chmod 666)"
     if [[ "$ENVIRONMENT" == "prod" ]]; then
-        echo -e "         ${YELLOW}·${NC} Create Docker volumes ({{project-name}}_public_storage, {{project-name}}_db_data, {{project-name}}_redis_data)"
+        echo -e "         ${YELLOW}·${NC} Create Docker volumes ({{project-name}}_db_data, {{project-name}}_redis_data)"
     else
         echo -e "         ${YELLOW}·${NC} Skip external volumes (development uses local named volumes)"
     fi
     echo -e "         ${YELLOW}·${NC} Create storage symlink (public/storage -> storage/app/public)"
-    echo -e "         ${YELLOW}·${NC} Create storage/app/backups directory (bind mount for spatie/laravel-backup)"
+    echo -e "         ${YELLOW}·${NC} Create storage/app skeleton (public, private, backups) — bind mount dos containers"
+    if [[ "$ENVIRONMENT" == "prod" ]]; then
+        echo -e "         ${YELLOW}·${NC} Set storage/app ownership (www-data uid 33) and permissions (2775/664)"
+    fi
 fi
 
 if [[ "$FIRST_DEPLOY" == true && "$DRY_RUN" == false ]]; then
@@ -608,7 +611,7 @@ if [[ "$FIRST_DEPLOY" == true && "$DRY_RUN" == false ]]; then
         "Set log file permissions"
 
     if [[ "$ENVIRONMENT" == "prod" ]]; then
-        for volume in {{project-name}}_public_storage {{project-name}}_db_data {{project-name}}_redis_data; do
+        for volume in {{project-name}}_db_data {{project-name}}_redis_data; do
             if docker volume inspect "$volume" > /dev/null 2>&1; then
                 log "INFO" "Docker volume '$volume' already exists, skipping."
             else
@@ -626,13 +629,21 @@ if [[ "$FIRST_DEPLOY" == true && "$DRY_RUN" == false ]]; then
             "Create storage symlink (public/storage -> storage/app/public)"
     fi
 
-    # spatie/laravel-backup writes here from inside the php-fpm/scheduler container
-    # (www-data). This host dir is bind-mounted into those containers, so it must
-    # exist before they start and be writable by www-data (uid matches the deploy user).
-    if [[ -d "$PROJECT_DIR/storage/app/backups" ]]; then
-        log "INFO" "Directory 'storage/app/backups' already exists, skipping."
-    else
-        run_cmd "mkdir -p \"$PROJECT_DIR/storage/app/backups\"" "Create storage/app/backups directory"
+    # storage/app inteiro é bind-mounted nos containers (uploads públicos servidos
+    # pelo nginx, arquivos privados do disco `local` e backups do spatie). Precisa
+    # existir antes do up e ser gravável pelo www-data do container (uid 33).
+    run_cmd "mkdir -p \"$PROJECT_DIR/storage/app/public\" \"$PROJECT_DIR/storage/app/private\" \"$PROJECT_DIR/storage/app/backups\"" \
+        "Create storage/app skeleton (public, private, backups)"
+
+    # Dono uid 33 (www-data do container prod); grupo = grupo do usuário de deploy,
+    # com setgid (2775) nos diretórios para que arquivos criados pelo container
+    # herdem o grupo — assim o host continua lendo/removendo (backups, uploads).
+    # Em dev não é necessário: o Dockerfile de dev alinha o UID do www-data ao host.
+    if [[ "$ENVIRONMENT" == "prod" ]]; then
+        run_cmd "sudo chown -R 33:$(id -g) \"$PROJECT_DIR/storage/app\" \
+            && sudo find \"$PROJECT_DIR/storage/app\" -type d -exec chmod 2775 {} + \
+            && sudo find \"$PROJECT_DIR/storage/app\" -type f -exec chmod 664 {} +" \
+            "Set storage/app ownership (www-data uid 33) and permissions (2775/664)"
     fi
 
     if [[ "$ENVIRONMENT" == "dev" ]]; then

@@ -19,6 +19,10 @@ RUN mv "${PHP_INI_DIR}/php.ini-production" "${PHP_INI_DIR}/php.ini" && rm "${PHP
 COPY docker/production/php-fpm/99-overrides.ini /usr/local/etc/php/conf.d/99-overrides.ini
 COPY docker/production/php-fpm/php-fpm-overrides.conf /usr/local/etc/php-fpm.d/zzz-app.conf
 
+# pecl channel-update: o índice do canal pecl.php.net vem embutido (e desatualizado) na
+# imagem base php:8.4.6-fpm. Sem refazê-lo, o pecl não resolve versões novas das extensões
+# e o build morre com "'<ext>' does not exist" no docker-php-ext-enable. opcache é bundled
+# na imagem oficial php:fpm (vem compilado mas DESABILITADO), por isso abaixo é só habilitado.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         zip \
         unzip \
@@ -33,13 +37,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libfreetype6-dev \
         libfcgi-bin \
         default-mysql-client \
+    && pecl channel-update pecl.php.net \
     && pecl install \
         ds \
         redis \
     && docker-php-ext-enable \
         ds \
         redis \
-	opcache \
+        opcache \
     && docker-php-ext-configure gd \
         --with-freetype \
         --with-jpeg \
@@ -73,9 +78,26 @@ COPY . .
 
 COPY --from=node-build-stage /app/public/build/ /var/www/public/build/
 
+# storage/ está no .dockerignore, então o COPY . . acima NÃO trouxe nada de storage.
+# Recriamos aqui só o ESQUELETO vazio. Distinção crítica entre os subdiretórios:
+#   • app/ e logs/ são apenas pontos de montagem — o conteúdo real vem dos bind mounts
+#     de runtime (./storage/app, ./storage/logs), então ficam vazios na imagem.
+#   • framework/ NÃO é montado: é usado de dentro da própria imagem (cache compilado,
+#     sessões file, views Blade), então PRECISA existir de fato, senão o app quebra na
+#     primeira view. Também deve existir antes do package:discover abaixo (que sobe o
+#     Laravel e pode escrever em storage/logs).
+RUN mkdir -p \
+        storage/app/public \
+        storage/app/private \
+        storage/app/backups \
+        storage/framework/cache/data \
+        storage/framework/sessions \
+        storage/framework/views \
+        storage/logs
+
 # Symlink public/storage -> ../storage/app/public embutido na imagem (substitui o
-# storage:link). O alvo é o volume public-storage montado em runtime; o symlink em si
-# não depende do host, então não precisamos mais de bind mount de ./public.
+# storage:link). O alvo é o bind mount de ./storage/app feito em runtime; o symlink em
+# si não depende do host, então não precisamos de bind mount de ./public.
 RUN ln -snf ../storage/app/public /var/www/public/storage
 
 # Remove qualquer cache compilado que possa ter vindo do contexto de build
