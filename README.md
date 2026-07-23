@@ -114,13 +114,39 @@ rollback rápido); em dev o código é **bind-mounted** (alterações na hora) +
 
 Todos os nomes específicos do projeto nos arquivos de config aparecem como o macro
 **`{{project-name}}`** (containers, imagens, volumes, *project name* do Compose, routers/labels do
-Traefik, etc.). Antes de subir, troque o macro pelo nome do seu projeto (use **kebab-case**, ex.:
-`minha-loja`):
+Traefik, hosts `*.local`/domínio, etc.). O macro é substituído **uma única vez** por um
+**slug kebab-case minúsculo** (ex.: `minha-loja`).
+
+> [!IMPORTANT]
+> O valor **precisa ser todo minúsculo**: o Docker rejeita maiúsculas em nomes de imagem e no
+> *project name* do Compose (`--project-name` em `dockerbuild`/`phartisan`/`phcomposer`), e os
+> hosts (`{{project-name}}.local`, domínio de produção) são sempre minúsculos. Digitar algo com
+> maiúscula/espaço quebra o build e o `deploy` com erros pouco óbvios.
+
+Para não depender de digitar certo, o comando abaixo **normaliza** o nome que você informar
+(minúsculas; espaços, `_` e caracteres inválidos viram `-`) e só então substitui em todos os
+arquivos:
 
 ```sh
-# na raiz do projeto — substitui em todos os arquivos (config + exemplos das docs)
-grep -rlI '{{project-name}}' . --exclude-dir=.git | xargs sed -i 's/{{project-name}}/minha-loja/g'
+# na raiz do projeto — informe o nome em qualquer forma; ele é normalizado para um slug
+RAW_NAME='Minha Loja'
+
+# minúsculas + acentos → ASCII (José → jose) + espaços/inválidos → "-"
+SLUG="$(printf '%s' "$RAW_NAME" \
+  | { iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || cat; } \
+  | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+  | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+
+echo "Slug do projeto: $SLUG"   # confira antes de aplicar
+
+grep -rlI '{{project-name}}' . --exclude-dir=.git \
+  | xargs sed -i "s/{{project-name}}/$SLUG/g"
 ```
+
+> [!NOTE]
+> `APP_NAME` no `.env` recebe o mesmo slug. Se quiser um **nome de exibição** com maiúsculas/espaços
+> (ex.: `"Minha Loja"`, usado em e-mails e no nome da pasta de backup), edite **apenas** o `APP_NAME`
+> à mão depois — todos os demais lugares (Docker, hosts) precisam do slug minúsculo.
 
 ### Onde o macro está
 
