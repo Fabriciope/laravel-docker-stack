@@ -88,6 +88,8 @@ Ponto de entrada interno. Recebe o tráfego do Traefik e:
 
 - Serve estáticos e os assets do Vite (`/build/*`) **direto do disco**.
 - Repassa requisições PHP ao `php-fpm` via FastCGI (`php-fpm:9000`).
+- Responde `GET /healthz` sozinho (`200 ok`, sem passar pelo php-fpm e sem access log) — é o
+  alvo do `healthcheck` do container.
 - Aplica headers de segurança (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`,
   e `Permissions-Policy` só em prod), bloqueia dotfiles e responde `404` em `/logs`.
 - **Em produção**, repassa o header `Authorization` ao PHP (`fastcgi_param HTTP_AUTHORIZATION`).
@@ -181,6 +183,8 @@ docker inspect -f '{{ json .Config.Labels }}' {{project-name}}-php-fpm_prod
      na imagem base fica desatualizado e faz o pecl não resolver versões novas das extensões,
      abortando o build com `'<ext>' does not exist` no `docker-php-ext-enable`. Atualizar o
      índice antes de instalar garante builds reproduzíveis.
+   - **`pecl install` com retry** (até 5×, 15s entre tentativas): o pecl.php.net devolve 504
+     transitórios que, sem isso, derrubam o build inteiro.
    - **OPcache é habilitado** (`docker-php-ext-enable opcache`): na imagem oficial `php:fpm` ele
      vem compilado mas **desabilitado** — sem habilitá-lo, toda a tunagem de `opcache.*` do
      `99-overrides.ini` de produção fica inerte.
@@ -196,8 +200,8 @@ docker inspect -f '{{ json .Config.Labels }}' {{project-name}}-php-fpm_prod
      **de fato** — não é montado e é usado de dentro da imagem (cache compilado, sessões, views),
      então precisa existir antes do `package:discover`, senão o app quebra na primeira view.
    - **Remove caches compilados** (`bootstrap/cache/*.php`): um `config.php` assado sem o `.env`
-     real sobrescreveria a config de runtime e quebraria o app. O cache correto é gerado pelo
-     `optimize` do deploy, já com o `.env` montado.
+     real sobrescreveria a config de runtime e quebraria o app. A config **nunca** é cacheada
+     (o deploy gera só os caches de rotas/views/eventos).
    - Define `HOME=/home/www-data` **gravável** (sem isso o Tinker/PsySH falha ao escrever
      histórico/config) e roda como usuário `www-data`.
 
@@ -210,8 +214,8 @@ symlink de storage e ajusta o dono — para servir tudo sem bind mount do host.
 
 - Usa `php.ini-development` e adiciona **Xdebug** (porta 9003, conecta ao IDE via
   `host.docker.internal`, resolvido por `extra_hosts` no compose). Como em produção, roda
-  `pecl channel-update` antes do `pecl install` — sem isso o pecl não resolve o Xdebug e o
-  build falha com `'xdebug' does not exist`.
+  `pecl channel-update` antes do `pecl install` (também com retry) — sem isso o pecl não resolve
+  o Xdebug e o build falha com `'xdebug' does not exist`.
 - **Alinha o UID/GID** do `www-data` ao usuário do host (`HOST_UID`/`HOST_GID`, padrão 1000)
   para o php-fpm conseguir escrever nos arquivos bind-mounted sem erro de permissão.
 - Um **entrypoint** roda `composer install` automaticamente no primeiro start, caso `vendor/`
@@ -336,11 +340,12 @@ O `.env` é **bind-mounted** nos containers e **nunca** entra na imagem (está n
 Decisão deliberada:
 
 - **Segredos fora da imagem** — a imagem pode ser reconstruída/versionada sem carregar senhas.
-- **Trocar config sem rebuild** — alterar o `.env` só exige recriar os containers
-  (`deploy prod --skip-build`), não um build novo.
+- **Trocar config sem rebuild** — alterar o `.env` não exige build novo nem recriar containers
+  (ver abaixo).
 
-Como o `.env` é montado em runtime e o `config:cache` é gerado pelo `optimize` do deploy (com o
-`.env` já presente), a config sempre reflete o ambiente real — nunca um snapshot assado no build.
+Como o `.env` é montado em runtime e a config **não é cacheada** (o deploy não roda
+`config:cache`), a config sempre reflete o ambiente real — nunca um snapshot assado no build — e
+editar o `.env` (in-place, ex.: `nano`) vale no próximo request, sem recriar containers.
 
 > O deploy de produção reescreve o ponteiro `PROJECT_VERSION` no `.env` e re-aplica
 > dono/permissões (`www-data`, `chmod 660`) — o que explica o `sudo` no deploy. O porquê dessa

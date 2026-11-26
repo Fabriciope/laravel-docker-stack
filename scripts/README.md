@@ -41,7 +41,7 @@ flowchart TD
     B --> C["build da imagem<br/>(pulado com --skip-build)"]
     C --> D["docker compose up<br/>--force-recreate --remove-orphans"]
     D --> E["key:generate + migrate --seed<br/>(só com --first-deploy)"]
-    E --> F["optimize:clear + optimize"]
+    E --> F["optimize:clear + route/view/event:cache<br/>(caches só em prod; config nunca)"]
     F --> G["atualiza PROJECT_VERSION no .env<br/>+ prune das imagens antigas<br/>(só em prod)"]
     G --> H(["fim"])
 
@@ -93,11 +93,11 @@ O `deploy` é quem gerencia esse ponteiro e o ciclo de vida das imagens:
 ```mermaid
 flowchart TD
     A["deploy prod --version 1.2.0"] --> B["build → tag 1.2.0-prod (mantém as antigas)"]
-    B --> C["up --force-recreate + optimize"]
+    B --> C["up --force-recreate + caches"]
     C --> D["PROJECT_VERSION=1.2.0 + prune (mantém N)"]
 
     R["deploy prod --rollback 1.1.0"] --> S["valida imagens 1.1.0-prod"]
-    S --> T["up --no-build --force-recreate + optimize"]
+    S --> T["up --no-build --force-recreate + caches"]
     T --> U["PROJECT_VERSION=1.1.0"]
 ```
 
@@ -112,11 +112,25 @@ flowchart TD
 > versão mais nova aplicou migrations incompatíveis, avalie manualmente (ex.: backup +
 > `migrate:rollback`). O script exibe esse aviso ao final.
 
-**Por que o deploy mexe no `.env` (e pede `sudo`):** ao reescrever `PROJECT_VERSION`, o `sed`
-troca o inode do arquivo e derruba o grupo `www-data` — deixando o php-fpm sem conseguir ler o
-`.env`. O script então re-aplica `chown :www-data` + `chmod 660` (grupo `www-data`, modo 660). O
-`g+w` também é exigido pelo `key:generate` no primeiro deploy, que escreve o `APP_KEY` de dentro
-do container.
+**Por que o deploy mexe no `.env` (e pede `sudo`):** o `.env` precisa do grupo `www-data` com
+modo 660 para o php-fpm conseguir lê-lo; o `g+w` também é exigido pelo `key:generate` no primeiro
+deploy, que escreve o `APP_KEY` de dentro do container. O script re-aplica `chown :www-data` +
+`chmod 660` sempre que toca no arquivo.
+
+**Por que o `PROJECT_VERSION` é gravado in-place:** o `.env` é montado nos containers como
+**bind mount de arquivo único**, que gruda no *inode*. Ferramentas que salvam por *rename*
+(`sed -i`, vim, VS Code) criam um inode novo e o container continua lendo o arquivo **velho** até
+ser recriado. Por isso o deploy grava num temp e devolve com `cat >` (mesmo inode). Vale para você
+também: edite o `.env` de produção com `nano` (in-place). Se uma edição "não pegou", rode
+`docker restart {{project-name}}-php-fpm_prod`.
+
+**Por que não há `config:cache`:** o deploy roda `optimize:clear` e depois só `route:cache`,
+`view:cache` e `event:cache` — **nunca** `optimize`, que inclui o `config:cache`. Sem config em
+cache, o Laravel lê o `.env` a cada request, então **editar o `.env` vale no próximo request**,
+sem redeploy. Não rode `optimize`/`config:cache` em produção: congela o `.env` (desfazer:
+`./scripts/phartisan config:clear`). Em dev nenhum cache é gerado.
+Exceção: o **Horizon** é um processo longo e só relê o `.env` ao reiniciar
+(`./scripts/phartisan horizon:terminate` — o container sobe de novo sozinho).
 
 ### Primeiro deploy
 
@@ -195,7 +209,8 @@ Equivale a `docker compose --project-name {{project-name}}_<ambiente> --file doc
 deixa o arquivo com 0 byte mas **preserva o inode, dono, permissões e os file handles** já
 abertos pelos processos (nginx, php-fpm, Laravel, Horizon). Assim os logs continuam sendo
 escritos no mesmo arquivo, sem recriar nada nem reiniciar containers. Ao final, limpa o cache do
-Log Viewer (best-effort).
+Log Viewer **arquivo por arquivo** (`clearCache()` via tinker, best-effort) — o
+`log-viewer:clear-cache` não basta: o índice velho de um arquivo truncado continuaria valendo.
 
 ```sh
 ./scripts/clean_logs                  # trunca todos os .log
@@ -204,7 +219,7 @@ Log Viewer (best-effort).
 ./scripts/clean_logs --only=2,4       # trunca SOMENTE os índices 2 e 4
 ./scripts/clean_logs nginx            # restringe a um subdiretório (nginx, php-fpm)
 ./scripts/clean_logs --dry-run        # mostra o que faria, sem alterar nada
-./scripts/clean_logs --no-cache-clear # não roda o log-viewer:clear-cache ao final
+./scripts/clean_logs --no-cache-clear # não limpa o cache do Log Viewer ao final
 ```
 
 `--except` e `--only` são **inversos e mutuamente exclusivos**: `--except` lista o que **não**
@@ -272,8 +287,11 @@ middleware `App\Http\Middleware\LogViewerBasicAuth`:
 
 > [!IMPORTANT]
 > Logs contêm dados sensíveis (stack traces, IPs, dados de clientes). **Sempre** defina
-> `LOG_VIEWER_AUTH_USER` e `LOG_VIEWER_AUTH_PASSWORD` em produção. Após alterá-las, recarregue a
-> config: `./scripts/phartisan config:cache` (ou um novo deploy).
+> `LOG_VIEWER_AUTH_USER` e `LOG_VIEWER_AUTH_PASSWORD` em produção. Como a config não é cacheada,
+> a mudança no `.env` vale no próximo request (edite in-place — ver [`deploy`](#deploy)).
+
+Antes do Basic Auth roda um `throttle` (30 req/min por IP na página, 120 na API), que limita
+força bruta contra a senha.
 
 Em produção, o Nginx repassa o header `Authorization` ao php-fpm para o Basic Auth funcionar —
 detalhe em [`docker/README.md › Serviços`](../docker/README.md#serviços). Para **esvaziar** os

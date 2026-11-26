@@ -22,14 +22,14 @@ set -euo pipefail
 #   ./scripts/clean_logs --dry-run       # mostra o que faria, sem alterar nada
 #   ./scripts/clean_logs nginx           # restringe a um subdiretório de logs
 #   ./scripts/clean_logs --only=2 php-fpm
-#   ./scripts/clean_logs --no-cache-clear  # não roda log-viewer:clear-cache
+#   ./scripts/clean_logs --no-cache-clear  # não limpa o cache do log-viewer
 #
 # --except e --only são inversos e mutuamente exclusivos. Os índices correspondem
 # à numeração exibida por --list (e impressa antes de truncar). Rode
 # `--list [subdir]` primeiro para descobrir os números.
 #
-# Após truncar, o script roda automaticamente `log-viewer:clear-cache` dentro do
-# container php-fpm (best-effort; desative com --no-cache-clear). Veja NOTA no fim.
+# Após truncar, o script limpa o cache do log-viewer (clearCache() de cada arquivo,
+# via tinker) dentro do container php-fpm (best-effort; desative com --no-cache-clear).
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -204,14 +204,19 @@ if ! $LIST_ONLY && ! $DRY_RUN && $CACHE_CLEAR && [ "$cleaned" -gt 0 ]; then
 
   if [ -z "$php_container" ]; then
     echo
-    echo "${YELLOW}container php-fpm não está rodando — pulando log-viewer:clear-cache.${RESET}"
+    echo "${YELLOW}container php-fpm não está rodando — pulando a limpeza do cache do log-viewer.${RESET}"
   else
     echo
     echo "${BLUE}Limpando cache do log-viewer (${php_container})...${RESET}"
-    if "$SCRIPT_DIR/phartisan" log-viewer:clear-cache >/dev/null 2>&1; then
+    # tinker --execute retorna exit != 0 mesmo em sucesso, e o script roda com
+    # `set -o pipefail`; então detectamos o sucesso por uma marca impressa no stdout.
+    # clearCache() por arquivo (esquece o metadata+índice no Redis). O LogViewer::
+    # clearFileCache() NÃO serve aqui: só zera a lista em memória do request atual.
+    cache_out="$("$SCRIPT_DIR/phartisan" tinker --execute="foreach(\Opcodes\LogViewer\Facades\LogViewer::getFiles() as \$f){ \$f->clearCache(); } echo 'CLEARED_OK';" 2>&1 || true)"
+    if echo "$cache_out" | grep -q 'CLEARED_OK'; then
       echo "${GREEN}cache do log-viewer limpo.${RESET}"
     else
-      echo "${YELLOW}não foi possível limpar o cache (pacote ausente ou comando indisponível) — ignorando.${RESET}"
+      echo "${YELLOW}não foi possível limpar o cache (pacote ausente ou tinker falhou) — ignorando.${RESET}"
     fi
   fi
 fi

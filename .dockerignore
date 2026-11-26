@@ -12,6 +12,10 @@
 _ide_helper.php
 /.config
 
+# Cache do Composer (metadados do packagist + pacotes baixados). Regenerável; o build
+# roda `composer install` do lock ANTES do COPY . ., então não depende deste cache.
+/.composer
+
 .git
 .gitignore
 .gitattributes

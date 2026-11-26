@@ -61,14 +61,29 @@ Copie cada um para o caminho equivalente no seu projeto:
 
 | Arquivo aqui | Destino no seu projeto | O que faz |
 |---|---|---|
-| `config/log-viewer.php` | `config/log-viewer.php` | Liga o Basic Auth dedicado (middleware abaixo) e varre `storage/logs/**/*.log`. |
-| `config/backup.php` | `config/backup.php` | Dump **só do banco** para o disco `backups`; retenção; e-mail de alerta. |
+| `config/log-viewer.php` | `config/log-viewer.php` | Liga o Basic Auth dedicado (middleware abaixo) com `throttle` antes dele (anti brute force), varre `storage/logs/**/*.log` e tira o `xdebug.log` em produção. |
+| `config/backup.php` | `config/backup.php` | Dump **só do banco** para o disco `backups`; retenção; e-mail **só em falha**; log no canal `backup`. |
 | `app/Http/Middleware/LogViewerBasicAuth.php` | `app/Http/Middleware/` | Protege `/log-viewer` (fail-closed em produção). |
+| `app/Logs/*.php` | `app/Logs/` | Leitores do log-viewer para os logs da stack que ele não conhece de fábrica (ver abaixo). |
 | `app/Providers/HorizonServiceProvider.php` | `app/Providers/` | Define o gate `viewHorizon` (edite os e-mails de admin). |
 
 > O `HorizonServiceProvider` vem com o gate **genérico** (`app()->isLocal()` libera em dev; em
 > produção, preencha a lista de e-mails). Se você rodou `horizon:install`, este arquivo
 > **substitui** o provider publicado.
+
+**Leitores de log (`app/Logs/`).** Sem eles, os logs da stack aparecem no `/log-viewer` como
+"Unknown" (texto cru) ou com o parser errado:
+
+| Arquivo de log | Leitor | Observação |
+|---|---|---|
+| `php-fpm/www.access.log` | `FpmAccessLog` | Casa com o `access.format` de `docker/*/php-fpm/php-fpm-overrides.conf` — **mudou um, muda o outro**. |
+| `php-fpm/www.app.log` | `PhpErrorLog` (+ `PhpErrorLevel`) | Erros do PHP gravados pelo pool. |
+| `deploy.log` | `DeployLog` (+ `DeployLevel`) | Log do `./scripts/deploy`. |
+| `php-fpm/xdebug.log` | `XdebugLog` (+ `XdebugLevel`) | Só em dev (o Xdebug não roda em produção). |
+
+O `FpmLogTypeRegistrar` força o tipo de cada um **pelo nome do arquivo**: a detecção por conteúdo
+do pacote falha em arquivo vazio (ex.: logo após um `clean_logs`) e o tipo errado fica cacheado.
+Eles precisam ser registrados no `AppServiceProvider` (seção 3).
 
 ---
 
@@ -116,20 +131,62 @@ Schedule::command('backup:run --only-db')
     ->onOneServer();
 ```
 
-### `app/Providers/AppServiceProvider.php` — gate do Pulse
+### `config/logging.php` — canal `backup`
 
-No `boot()`, defina quem acessa `/pulse` (não copiamos o `AppServiceProvider` porque o seu já
-tem lógica própria):
+O `config/backup.php` grava no canal `backup` (`log_channel`). Adicione em `channels`:
 
 ```php
-use Illuminate\Support\Facades\Gate;
+// Arquivo único (não 'daily') e nível fixo em 'info': o resultado do backup é sempre
+// gravado, independente do LOG_LEVEL do app, e fica separado do laravel.log.
+'backup' => [
+    'driver' => 'single',
+    'path' => storage_path('logs/db-backup.log'),
+    'level' => 'info',
+    'replace_placeholders' => true,
+],
+```
 
-Gate::define('viewPulse', function ($user = null) {
-    // Local liberado; em produção, preencha os e-mails de admin.
-    return app()->isLocal() || in_array(optional($user)->email, [
-        // 'admin@example.com',
-    ], true);
-});
+> O `./scripts/deploy <env> --first-deploy` já cria o `storage/logs/db-backup.log` com as
+> permissões certas.
+
+### `app/Providers/AppServiceProvider.php` — gate do Pulse e leitores de log
+
+Não copiamos o `AppServiceProvider` porque o seu já tem lógica própria; mescle estes trechos:
+
+```php
+use App\Logs\DeployLog;
+use App\Logs\FpmAccessLog;
+use App\Logs\FpmLogTypeRegistrar;
+use App\Logs\PhpErrorLog;
+use App\Logs\XdebugLog;
+use Illuminate\Support\Facades\Gate;
+use Opcodes\LogViewer\Facades\LogViewer;
+use Opcodes\LogViewer\LogTypeRegistrar;
+
+public function register(): void
+{
+    // Troca o registrar do log-viewer pelo nosso (tipo forçado pelo nome do arquivo).
+    // O pacote só faz o bind `if (! bound)`, então registrar aqui tem precedência.
+    $this->app->singleton(LogTypeRegistrar::class, FpmLogTypeRegistrar::class);
+}
+
+public function boot(): void
+{
+    Gate::define('viewPulse', function ($user = null) {
+        // Local liberado; em produção, preencha os e-mails de admin.
+        return app()->isLocal() || in_array(optional($user)->email, [
+            // 'admin@example.com',
+        ], true);
+    });
+
+    LogViewer::extend('php-fpm-access', FpmAccessLog::class);
+    LogViewer::extend('php-errors', PhpErrorLog::class);
+    LogViewer::extend('deploy', DeployLog::class);
+
+    if (! $this->app->isProduction()) {
+        LogViewer::extend('xdebug', XdebugLog::class);
+    }
+}
 ```
 
 ### `bootstrap/providers.php` — registrar o Horizon provider

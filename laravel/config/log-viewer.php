@@ -1,8 +1,8 @@
 <?php
 
+use App\Http\Middleware\LogViewerBasicAuth;
 use Opcodes\LogViewer\Enums\SortingMethod;
 use Opcodes\LogViewer\Enums\SortingOrder;
-use App\Http\Middleware\LogViewerBasicAuth;
 use Opcodes\LogViewer\Enums\Theme;
 use Opcodes\LogViewer\Http\Middleware\EnsureFrontendRequestsAreStateful;
 
@@ -121,6 +121,10 @@ return [
 
     'middleware' => [
         'web',
+        // throttle ANTES do Basic Auth: cada tentativa (mesmo com credencial errada)
+        // conta, limitando brute force do Basic Auth por IP. Carregar a página é raro
+        // para um admin legítimo, então 30/min sobra.
+        'throttle:30,1',
         LogViewerBasicAuth::class,
     ],
 
@@ -135,6 +139,9 @@ return [
 
     'api_middleware' => [
         EnsureFrontendRequestsAreStateful::class,
+        // Limite generoso: a UI do log-viewer faz vários requests ao navegar, mas
+        // ainda barra brute force do Basic Auth nas rotas de API. Ajustável.
+        'throttle:120,1',
         LogViewerBasicAuth::class,
     ],
 
@@ -188,13 +195,11 @@ return [
     'include_files' => [
         // Varre todos os .log de storage/logs, incluindo os subdiretórios
         // nginx/ e php-fpm/ (bind-montados nos containers — ver docker-compose).
-        // O tipo de cada arquivo é autodetectado pelo conteúdo:
-        //   nginx/access.log  -> "HTTP Access"        (formato combined padrão do nginx)
-        //   nginx/error.log   -> "HTTP Error (Nginx)"
-        //   php-fpm/php-fpm.log -> "PHP-FPM"
-        //   laravel.log       -> "Laravel"
-        // (O access.format customizado do php-fpm em www.access.log não tem parser
-        //  embutido e fica como "Unknown" — escondido por hide_unknown_files abaixo.)
+        // Embutidos (autodetectados): nginx/access.log e nginx/error.log
+        // (HTTP Access / HTTP Error), php-fpm/php-fpm.log (PHP-FPM), laravel.log
+        // (Laravel). Nossos (forçados por nome, app/Logs/*): www.access.log,
+        // www.app.log, deploy.log e — só em dev — xdebug.log. Na prática nada
+        // fica "Unknown".
         '*.log',
         '**/*.log',
     ],
@@ -207,9 +212,11 @@ return [
     |
     */
 
-    'exclude_files' => [
-        // 'my_secret.log'
-    ],
+    'exclude_files' => array_values(array_filter([
+        // O xdebug.log é formatado pelo App\Logs\XdebugLog em dev. Em produção o
+        // Xdebug não roda; se por acaso um xdebug.log existisse, fica fora do viewer.
+        env('APP_ENV', 'production') === 'production' ? '**/xdebug.log' : null,
+    ])),
 
     /*
     |--------------------------------------------------------------------------
@@ -221,7 +228,9 @@ return [
     |
     */
 
-    'hide_unknown_files' => true,
+    // false: se algum .log sem parser aparecer, mostramos como "Unknown" (texto puro)
+    // em vez de escondê-lo. Hoje todos os nossos logs têm parser próprio (app/Logs/*).
+    'hide_unknown_files' => false,
 
     /*
     |--------------------------------------------------------------------------

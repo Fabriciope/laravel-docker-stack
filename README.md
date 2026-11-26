@@ -152,22 +152,22 @@ grep -rlI '{{project-name}}' . --exclude-dir=.git \
 
 | Arquivo | Ocorrências | O que o macro nomeia |
 |---|---|---|
-| `docker/production/docker-compose.yml` | 46 | containers, imagens, volumes, project-name, routers/middlewares Traefik, labels |
-| `docker/development/docker-compose.yml` | 46 | idem (ambiente de desenvolvimento) |
-| `scripts/deploy` | 11 | imagens/volumes, project-name do Compose, detecção de container |
+| `docker/production/docker-compose.yml` | 55 | containers, imagens, volumes, project-name, routers/middlewares Traefik, labels |
+| `docker/development/docker-compose.yml` | 55 | idem (ambiente de desenvolvimento) |
+| `scripts/deploy` | 13 | imagens/volumes, project-name do Compose, detecção de container |
 | `scripts/phartisan` · `scripts/phcomposer` | 3 cada | seleção do container `php-fpm` em execução |
 | `scripts/dockerbuild` | 1 | project-name do Compose |
 | `scripts/clean_logs` | 1 | detecção do container `php-fpm` |
 | `docker/production/{php-fpm,nginx}/Dockerfile` | 1 cada | título OCI da imagem |
 | `docker/development/{php-fpm,nginx}/Dockerfile` | 1 cada | título OCI da imagem |
-| `.env.stack.example` | 5 | `APP_NAME`, `APP_URL`, `DB_DATABASE`, `DB_USERNAME` |
+| `.env.stack.example` | 6 | `APP_NAME`, `APP_URL`, `DB_DATABASE`, `DB_USERNAME` |
 
-> Os exemplos em `docker/README.md` (13×) e `scripts/README.md` (8×) também usam o macro — o
+> Os exemplos em `docker/README.md` (13×) e `scripts/README.md` (9×) também usam o macro — o
 > find/replace global acima já cuida deles.
 
 > [!IMPORTANT]
 > **Domínio:** além do macro, troque `example.com` pelo seu domínio real em
-> `docker/production/docker-compose.yml` (linhas **3** e **63**) e no `APP_URL` do `.env`. Em
+> `docker/production/docker-compose.yml` (linhas **3** e **64**) e no `APP_URL` do `.env`. Em
 > desenvolvimento o host é `{{project-name}}.local` (sem domínio).
 
 > [!NOTE]

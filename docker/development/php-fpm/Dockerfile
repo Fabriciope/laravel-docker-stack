@@ -14,6 +14,8 @@ COPY docker/development/php-fpm/php-fpm-overrides.conf /usr/local/etc/php-fpm.d/
 # imagem base php:8.4.6-fpm. Sem refazê-lo, o pecl não resolve versões novas das extensões
 # e o build morre com "'xdebug' does not exist" no docker-php-ext-enable. opcache é bundled
 # na imagem oficial php:fpm (vem compilado mas DESABILITADO), por isso abaixo é só habilitado.
+# O `pecl install` roda com retry (até 5×, 15s entre tentativas): o pecl.php.net tem 504s
+# transitórios que, sem isso, derrubam o build inteiro no primeiro soluço de rede.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         zip \
         unzip \
@@ -29,10 +31,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libfcgi-bin \
         default-mysql-client \
     && pecl channel-update pecl.php.net \
-    && pecl install \
-        ds \
-        redis \
-        xdebug \
+    && for ext in ds redis xdebug; do \
+           n=0; \
+           until pecl install "$ext"; do \
+               n=$((n+1)); \
+               [ "$n" -ge 5 ] && { echo "pecl install $ext falhou após 5 tentativas" >&2; exit 1; }; \
+               echo "pecl install $ext: retry $n/5 em 15s..."; \
+               sleep 15; \
+           done; \
+       done \
     && docker-php-ext-enable \
         ds \
         redis \

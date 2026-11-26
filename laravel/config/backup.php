@@ -157,9 +157,10 @@ return [
              * Check supported levels for the chosen algorithm, usually 1 means the fastest and weakest compression,
              * while 9 the slowest and strongest one.
              *
-             * Setting of 0 for some algorithms may switch to the strongest compression.
+             * Com CM_STORE (sem compressão) o nível é irrelevante — 0 conforme a
+             * recomendação acima. O dump do banco já vai gzipado (database_dump_compressor).
              */
-            'compression_level' => 9,
+            'compression_level' => 0,
 
             /*
              * The filename prefix used for the backup zip file.
@@ -194,7 +195,10 @@ return [
          * The password to be used for archive encryption.
          * Set to `null` to disable encryption.
          */
-        'password' => env('BACKUP_ARCHIVE_PASSWORD'),
+        // `?: null`: com `BACKUP_ARCHIVE_PASSWORD=` vazio no .env, env() devolve ""
+        // (não null) — o spatie testa `!== null`, ligaria a cifragem com senha vazia
+        // e o zip morreria em ZipArchive::close() com "Invalid argument".
+        'password' => env('BACKUP_ARCHIVE_PASSWORD') ?: null,
 
         /*
          * The encryption algorithm to be used for archive encryption.
@@ -233,12 +237,14 @@ return [
      */
     'notifications' => [
         'notifications' => [
+            // Falhas → e-mail (além do log). Sucessos → SEM e-mail (ficam só no log
+            // do canal `backup`): elimina o e-mail diário de "backup ok".
             BackupHasFailedNotification::class => ['mail'],
             UnhealthyBackupWasFoundNotification::class => ['mail'],
             CleanupHasFailedNotification::class => ['mail'],
-            BackupWasSuccessfulNotification::class => ['mail'],
-            HealthyBackupWasFoundNotification::class => ['mail'],
-            CleanupWasSuccessfulNotification::class => ['mail'],
+            BackupWasSuccessfulNotification::class => [],
+            HealthyBackupWasFoundNotification::class => [],
+            CleanupWasSuccessfulNotification::class => [],
         ],
 
         /*
@@ -299,7 +305,7 @@ return [
      * Set to false to disable backup logging entirely.
      * Set to null to use the default log channel.
      */
-    'log_channel' => null,
+    'log_channel' => 'backup',
 
     /*
      * Here you can specify which backups should be monitored.

@@ -283,15 +283,24 @@ set_current_version() {
         return 0
     fi
 
+    # Escrita IN-PLACE (preserva o inode do .env). `sed -i` salva por rename e troca
+    # o inode → o bind mount de arquivo único dos containers ficaria preso no arquivo
+    # antigo. Aqui a transformação vai para um temp e volta com `cat > ` (trunca o
+    # MESMO inode e reescreve), então o .env visto pelos containers continua sendo o
+    # mesmo arquivo. O `>> ` do else já preserva o inode (append).
     if grep -qE '^PROJECT_VERSION=' "$ENV_FILE" 2>/dev/null; then
-        sed -i -E "s|^PROJECT_VERSION=.*|PROJECT_VERSION=$v|" "$ENV_FILE"
+        local tmp
+        tmp="$(mktemp)"
+        sed -E "s|^PROJECT_VERSION=.*|PROJECT_VERSION=$v|" "$ENV_FILE" > "$tmp"
+        [[ -s "$tmp" ]] && cat "$tmp" > "$ENV_FILE"   # -s: nunca truncar o .env com um temp vazio
+        rm -f "$tmp"
     else
         printf '\nPROJECT_VERSION=%s\n' "$v" >> "$ENV_FILE"
     fi
 
-    # The rewrite above replaces the file and drops the www-data group; restore
-    # it so the next container recreate can read the .env (otherwise REDIS_PASSWORD
-    # and friends come up empty and `optimize` fails to reach Redis).
+    # Defensive: the in-place write above keeps owner/group/mode, but re-assert the
+    # www-data group anyway — if it is ever lost, the containers can't read the .env
+    # (REDIS_PASSWORD and friends come up empty and artisan fails to reach Redis).
     enforce_env_permissions
 
     log "SUCCESS" "Updated .env pointer: PROJECT_VERSION=$v"
@@ -550,7 +559,7 @@ if [[ "$FIRST_DEPLOY" == true && "$DRY_RUN" == true ]]; then
         echo -e "         ${YELLOW}·${NC} Set .env group to www-data with permissions 660 (required for key:generate)"
     fi
     echo -e "         ${YELLOW}·${NC} Create log directories (storage/logs/nginx, storage/logs/php-fpm)"
-    echo -e "         ${YELLOW}·${NC} Create log files (nginx, php-fpm, laravel, deploy)"
+    echo -e "         ${YELLOW}·${NC} Create log files (nginx, php-fpm, laravel, db-backup, deploy)"
     echo -e "         ${YELLOW}·${NC} Set log file permissions (chmod 666)"
     if [[ "$ENVIRONMENT" == "prod" ]]; then
         echo -e "         ${YELLOW}·${NC} Create Docker volumes ({{project-name}}_db_data, {{project-name}}_redis_data)"
@@ -590,6 +599,7 @@ if [[ "$FIRST_DEPLOY" == true && "$DRY_RUN" == false ]]; then
         "$PROJECT_DIR/storage/logs/php-fpm/www.access.log"
         "$PROJECT_DIR/storage/logs/php-fpm/www.app.log"
         "$PROJECT_DIR/storage/logs/laravel.log"
+        "$PROJECT_DIR/storage/logs/db-backup.log"
         "$PROJECT_DIR/storage/logs/deploy.log"
     )
 
@@ -607,7 +617,8 @@ if [[ "$FIRST_DEPLOY" == true && "$DRY_RUN" == false ]]; then
     run_cmd "sudo chmod 666 \
         \"$PROJECT_DIR/storage/logs/nginx/\"*.log \
         \"$PROJECT_DIR/storage/logs/php-fpm/\"*.log \
-        \"$PROJECT_DIR/storage/logs/laravel.log\"" \
+        \"$PROJECT_DIR/storage/logs/laravel.log\" \
+        \"$PROJECT_DIR/storage/logs/db-backup.log\"" \
         "Set log file permissions"
 
     if [[ "$ENVIRONMENT" == "prod" ]]; then
@@ -695,7 +706,14 @@ if [[ "$DO_ROLLBACK" == true ]]; then
     set_current_version "$ROLLBACK_VERSION"
 
     run_cmd "$SCRIPT_DIR/phartisan optimize:clear" "Artisan optimize:clear"
-    run_cmd "$SCRIPT_DIR/phartisan optimize" "Artisan optimize"
+    # Config NÃO é cacheada de propósito (não usar `optimize` — ele inclui config:cache):
+    # sem bootstrap/cache/config.php o Laravel lê o .env a cada request, então editar o
+    # .env em prod (in-place, ex.: nano) vale sozinho no próximo request — sem recachear,
+    # sem reload, sem recreate. Cacheamos só o que NÃO depende do .env: rotas, views e
+    # eventos.
+    run_cmd "$SCRIPT_DIR/phartisan route:cache" "Artisan route:cache"
+    run_cmd "$SCRIPT_DIR/phartisan view:cache" "Artisan view:cache"
+    run_cmd "$SCRIPT_DIR/phartisan event:cache" "Artisan event:cache"
 else
     if [[ "$ENVIRONMENT" == "prod" && "$GIT_PULL" == true ]]; then
         log "INFO" "Flag --git-pull detected. Pulling latest changes..."
@@ -718,7 +736,18 @@ else
     fi
 
     run_cmd "$SCRIPT_DIR/phartisan optimize:clear" "Artisan optimize:clear"
-    run_cmd "$SCRIPT_DIR/phartisan optimize" "Artisan optimize"
+    # Config NÃO é cacheada de propósito (não usar `optimize` — ele inclui config:cache):
+    # sem bootstrap/cache/config.php o Laravel lê o .env a cada request, então editar o
+    # .env em prod (in-place, ex.: nano) vale sozinho no próximo request — sem recachear,
+    # sem reload, sem recreate. Cacheamos só o que NÃO depende do .env: rotas, views e
+    # eventos.
+    # SÓ em prod: dev fica 100% sem caches (cache em dev mascara mudanças em
+    # rotas/config e faz testes falharem com estado velho).
+    if [[ "$ENVIRONMENT" == "prod" ]]; then
+        run_cmd "$SCRIPT_DIR/phartisan route:cache" "Artisan route:cache"
+        run_cmd "$SCRIPT_DIR/phartisan view:cache" "Artisan view:cache"
+        run_cmd "$SCRIPT_DIR/phartisan event:cache" "Artisan event:cache"
+    fi
 
     # Persist the current-version pointer and prune old images (prod only).
     if [[ "$ENVIRONMENT" == "prod" ]]; then
